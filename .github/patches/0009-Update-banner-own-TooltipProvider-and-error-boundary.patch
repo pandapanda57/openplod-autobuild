@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:38:43 -0800
+Subject: [PATCH 9/9] Update banner: own TooltipProvider and error boundary
+ (fixes blank window when an update exists)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ web/src/components/UpdateBanner.tsx | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/web/src/components/UpdateBanner.tsx b/web/src/components/UpdateBanner.tsx
+index 009c798..19179a1 100644
+--- a/web/src/components/UpdateBanner.tsx
++++ b/web/src/components/UpdateBanner.tsx
+@@ -1,8 +1,9 @@
+-import { useEffect, useRef, useState } from 'react'
++import { Component, useEffect, useRef, useState, type ReactNode } from 'react'
+ import type { Update } from '@tauri-apps/plugin-updater'
+ import { Download, Loader2, X } from '@/components/icons'
+ import { Button } from '@/components/ui/button'
+ import { IconButton } from '@/components/ui/icon-button'
++import { TooltipProvider } from '@/components/ui/tooltip'
+ import { backUpThenInstall, findUpdate, type InstallStage } from '@/lib/app-update'
+ import { getRuntime } from '@/lib/runtime'
+ import { t } from '@/i18n'
+@@ -10,8 +11,24 @@ import { t } from '@/i18n'
+ const FIRST_CHECK_MS = 10_000
+ const RECHECK_MS = 24 * 60 * 60 * 1000
+ 
+-/** Checks for a signed update shortly after start and once a day; offers a one-click install. */
++/** A failure inside the banner hides the banner only; it must never blank the whole app. */
++class BannerBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
++  state = { failed: false }
++  static getDerivedStateFromError() { return { failed: true } }
++  componentDidCatch(error: unknown) { console.error('[update banner]', error) }
++  render() { return this.state.failed ? null : this.props.children }
++}
++
++/**
++ * Rendered above the page layout, so it brings its own TooltipProvider (IconButton needs one)
++ * and its own error boundary. Settings → Check for updates stays available either way.
++ */
+ export function UpdateBanner() {
++  return <BannerBoundary><TooltipProvider><UpdateBannerContent /></TooltipProvider></BannerBoundary>
++}
++
++/** Checks for a signed update shortly after start and once a day; offers a one-click install. */
++function UpdateBannerContent() {
+   const [update, setUpdate] = useState<Update | null>(null)
+   const [dismissed, setDismissed] = useState<string | null>(null)
+   const [stage, setStage] = useState<InstallStage | null>(null)

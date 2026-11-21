@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Fri, 13 Nov 2026 11:57:02 -0800
-Subject: [PATCH 1/8] Fix Plaud import on Windows: don't truncate an
+Subject: [PATCH 1/9] Fix Plaud import on Windows: don't truncate an
  append-mode file
 
 openPlaudCheckpoint opened the resume file with 'a+' and then truncated
