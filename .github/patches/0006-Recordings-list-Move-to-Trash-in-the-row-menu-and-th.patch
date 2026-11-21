@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 13:08:42 -0800
-Subject: [PATCH 6/6] Recordings list: "Move to Trash" in the row menu and the
+Subject: [PATCH 6/7] Recordings list: "Move to Trash" in the row menu and the
  right-click menu
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

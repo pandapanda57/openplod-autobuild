@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 12:17:34 -0800
-Subject: [PATCH 5/6] Put a bundled ffmpeg first on the service's PATH when the
+Subject: [PATCH 5/7] Put a bundled ffmpeg first on the service's PATH when the
  build ships one
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

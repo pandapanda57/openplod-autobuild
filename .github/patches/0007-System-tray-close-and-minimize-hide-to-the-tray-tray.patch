@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:15:07 -0800
+Subject: [PATCH 7/7] System tray: close and minimize hide to the tray; tray
+ menu opens pages or quits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src-tauri/Cargo.toml                  |  2 +-
+ src-tauri/src/lib.rs                  |  6 ++
+ src-tauri/src/tray.rs                 | 83 +++++++++++++++++++++++++++
+ web/src/App.tsx                       |  2 +
+ web/src/components/TrayNavigation.tsx | 21 +++++++
+ 5 files changed, 113 insertions(+), 1 deletion(-)
+ create mode 100644 src-tauri/src/tray.rs
+ create mode 100644 web/src/components/TrayNavigation.tsx
+
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index eb3a589..7093698 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -21,7 +21,7 @@ tauri-build = { version = "2.6.3", features = [] }
+ serde_json = "1.0"
+ serde = { version = "1.0", features = ["derive"] }
+ log = "0.4"
+-tauri = { version = "2.11.3", features = [] }
++tauri = { version = "2.11.3", features = ["tray-icon"] }
+ tauri-plugin-log = "2"
+ tauri-plugin-shell = "2"
+ uuid = { version = "1", features = ["v4"] }
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 5c9bc86..ee97642 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -3,6 +3,8 @@ use tauri::Manager;
+ mod plaud;
+ #[cfg(desktop)]
+ mod desktop_exports;
++#[cfg(desktop)]
++mod tray;
+ 
+ #[cfg(desktop)]
+ use std::{fs, net::UdpSocket, path::PathBuf};
+@@ -168,6 +170,8 @@ pub fn run() {
+     .setup(|app| {
+       #[cfg(desktop)]
+       start_service(app)?;
++      #[cfg(desktop)]
++      tray::create(app)?;
+ 
+       #[cfg(mobile)]
+       app.manage(RuntimeInfo {
+@@ -183,6 +187,8 @@ pub fn run() {
+   // REL-07: update checks verify the release signature against the build-time public key.
+   #[cfg(desktop)]
+   let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
++  #[cfg(desktop)]
++  let builder = builder.on_window_event(tray::on_window_event);
+ 
+   #[cfg(desktop)]
+   let builder = builder.invoke_handler(tauri::generate_handler![
+diff --git a/src-tauri/src/tray.rs b/src-tauri/src/tray.rs
+new file mode 100644
+index 0000000..ffe3ca8
+--- /dev/null
++++ b/src-tauri/src/tray.rs
+@@ -0,0 +1,83 @@
++//! System tray icon. Closing or minimizing the window hides OpenPlod to the tray so the local
++//! service keeps running (automatic imports, update checks); "Quit OpenPlod" in the tray menu
++//! exits the app and, through `RunEvent::Exit`, stops the service.
++use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
++use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
++use tauri::{AppHandle, Emitter, Manager, Window, WindowEvent};
++
++const MAIN: &str = "main";
++
++/// Pages the tray menu can open. The web app listens for `tray-navigate` and routes there.
++const PAGES: [(&str, &str, &str); 3] = [
++  ("tray-record", "New recording", "/record"),
++  ("tray-device", "Plaud Device", "/devices"),
++  ("tray-settings", "Settings", "/settings"),
++];
++
++pub fn show_main_window(app: &AppHandle) {
++  if let Some(window) = app.get_webview_window(MAIN) {
++    let _ = window.unminimize();
++    let _ = window.show();
++    let _ = window.set_focus();
++  }
++}
++
++pub fn create(app: &tauri::App) -> tauri::Result<()> {
++  let open = MenuItem::with_id(app, "tray-open", "Open OpenPlod", true, None::<&str>)?;
++  let pages = PAGES
++    .iter()
++    .map(|(id, label, _)| MenuItem::with_id(app, *id, *label, true, None::<&str>))
++    .collect::<tauri::Result<Vec<_>>>()?;
++  let separator = PredefinedMenuItem::separator(app)?;
++  let quit = MenuItem::with_id(app, "tray-quit", "Quit OpenPlod", true, None::<&str>)?;
++  let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&open];
++  items.extend(pages.iter().map(|item| item as &dyn tauri::menu::IsMenuItem<tauri::Wry>));
++  items.push(&separator);
++  items.push(&quit);
++  let menu = Menu::with_items(app, &items)?;
++
++  let mut tray = TrayIconBuilder::with_id("openplod")
++    .tooltip("OpenPlod")
++    .menu(&menu)
++    .show_menu_on_left_click(false)
++    .on_menu_event(|app, event| {
++      let id = event.id().as_ref();
++      if id == "tray-quit" {
++        app.exit(0);
++      } else if id == "tray-open" {
++        show_main_window(app);
++      } else if let Some((_, _, path)) = PAGES.iter().find(|(page, _, _)| *page == id) {
++        show_main_window(app);
++        let _ = app.emit_to(MAIN, "tray-navigate", *path);
++      }
++    })
++    .on_tray_icon_event(|tray, event| {
++      if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
++        show_main_window(tray.app_handle());
++      }
++    });
++  if let Some(icon) = app.default_window_icon() {
++    tray = tray.icon(icon.clone());
++  }
++  tray.build(app)?;
++  Ok(())
++}
++
++/// Close (X) and minimize hide the main window to the tray instead of quitting or minimizing.
++pub fn on_window_event(window: &Window, event: &WindowEvent) {
++  if window.label() != MAIN {
++    return;
++  }
++  match event {
++    WindowEvent::CloseRequested { api, .. } => {
++      api.prevent_close();
++      let _ = window.hide();
++    }
++    WindowEvent::Resized(_) => {
++      if window.is_minimized().unwrap_or(false) {
++        let _ = window.hide();
++      }
++    }
++    _ => {}
++  }
++}
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index c1f560b..5618315 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -5,6 +5,7 @@ import { Loader2 } from "@/components/icons"
+ import { RuntimeGate } from '@/components/RuntimeGate'
+ import { SharedAudioRouter } from '@/components/SharedAudioRouter'
+ import { UpdateBanner } from '@/components/UpdateBanner'
++import { TrayNavigation } from '@/components/TrayNavigation'
+ import { t, useLocale } from '@/i18n'
+ 
+ const DevicesPage = lazy(() => import('@/pages/DevicesPage').then(module => ({ default: module.DevicesPage })))
+@@ -37,6 +38,7 @@ export default function App() {
+       <BrowserRouter key={locale} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+         <SharedAudioRouter />
+         <UpdateBanner />
++        <TrayNavigation />
+         <Suspense fallback={<PageFallback />}>
+           <Routes>
+             <Route element={<Layout />}>
+diff --git a/web/src/components/TrayNavigation.tsx b/web/src/components/TrayNavigation.tsx
+new file mode 100644
+index 0000000..1632146
+--- /dev/null
++++ b/web/src/components/TrayNavigation.tsx
+@@ -0,0 +1,21 @@
++import { useEffect } from 'react'
++import { useNavigate } from 'react-router-dom'
++import { getRuntime } from '@/lib/runtime'
++
++/** Opens the page chosen in the desktop tray menu (New recording, Plaud Device, Settings). */
++const ALLOWED = new Set(['/record', '/devices', '/settings'])
++
++export function TrayNavigation() {
++  const navigate = useNavigate()
++  const desktop = getRuntime().mode === 'desktop'
++  useEffect(() => {
++    if (!desktop) return
++    let stop: (() => void) | undefined
++    let disposed = false
++    void import('@tauri-apps/api/event').then(({ listen }) => listen<string>('tray-navigate', event => {
++      if (ALLOWED.has(event.payload)) navigate(event.payload)
++    })).then(unlisten => { if (disposed) unlisten(); else stop = unlisten }).catch(() => undefined)
++    return () => { disposed = true; stop?.() }
++  }, [desktop, navigate])
++  return null
++}
