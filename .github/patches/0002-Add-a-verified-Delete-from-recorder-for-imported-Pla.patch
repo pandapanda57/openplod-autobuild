@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 11:42:38 -0800
-Subject: [PATCH 2/7] Add a verified "Delete from recorder" for imported Plaud
+Subject: [PATCH 2/8] Add a verified "Delete from recorder" for imported Plaud
  recordings
 
 Deletes one recording from the Note Pro only after the vault copy checks out:

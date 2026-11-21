@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:22:48 -0800
+Subject: [PATCH 8/8] Recordings list: "Show in folder" opens the vault folder
+ with the audio file selected
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src-tauri/src/lib.rs         |  4 +-
+ src-tauri/src/reveal.rs      | 73 ++++++++++++++++++++++++++++++++++++
+ web/src/i18n/fr/workspace.ts |  1 +
+ web/src/pages/Dashboard.tsx  | 18 +++++++++
+ 4 files changed, 95 insertions(+), 1 deletion(-)
+ create mode 100644 src-tauri/src/reveal.rs
+
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index ee97642..e97325c 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -5,6 +5,8 @@ mod plaud;
+ mod desktop_exports;
+ #[cfg(desktop)]
+ mod tray;
++#[cfg(desktop)]
++mod reveal;
+ 
+ #[cfg(desktop)]
+ use std::{fs, net::UdpSocket, path::PathBuf};
+@@ -193,7 +195,7 @@ pub fn run() {
+   #[cfg(desktop)]
+   let builder = builder.invoke_handler(tauri::generate_handler![
+     runtime_info, plaud::plaud_command, desktop_exports::export_document, desktop_exports::export_audio,
+-    desktop_exports::pick_export_folder
++    desktop_exports::pick_export_folder, reveal::reveal_recording
+   ]);
+   #[cfg(mobile)]
+   let builder = builder.invoke_handler(tauri::generate_handler![runtime_info, plaud::plaud_command]);
+diff --git a/src-tauri/src/reveal.rs b/src-tauri/src/reveal.rs
+new file mode 100644
+index 0000000..fd245be
+--- /dev/null
++++ b/src-tauri/src/reveal.rs
+@@ -0,0 +1,73 @@
++//! "Show in folder": opens the system file manager on the vault's recordings folder with one
++//! recording's audio file selected. The web app passes only a recording ID; the file is looked up
++//! inside the recordings folder, so the command cannot be pointed at any other location.
++use std::path::{Path, PathBuf};
++use tauri::Manager;
++
++const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4a", "wav", "ogg", "webm", "aac", "flac"];
++
++/// The recording's audio file (`<id>.<audio extension>`) directly inside `folder`, if present.
++fn find_recording(folder: &Path, recording_id: &str) -> Option<PathBuf> {
++  let folder = folder.canonicalize().ok()?;
++  std::fs::read_dir(&folder).ok()?.flatten().map(|entry| entry.path()).find(|path| {
++    path.is_file()
++      && path.file_stem().and_then(|stem| stem.to_str()) == Some(recording_id)
++      && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
++  }).and_then(|path| path.canonicalize().ok()).filter(|path| path.parent() == Some(folder.as_path()))
++}
++
++/// Windows file-manager arguments want a plain path, not the `\\?\` form canonicalize returns.
++#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
++fn plain(path: &Path) -> PathBuf {
++  match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
++    Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
++    _ => path.to_path_buf(),
++  }
++}
++
++fn open_with_selection(path: &Path) -> std::io::Result<()> {
++  #[cfg(target_os = "windows")]
++  {
++    use std::os::windows::process::CommandExt;
++    let explorer = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join("explorer.exe");
++    // explorer.exe needs the path quoted after "/select,"; Windows paths cannot contain quotes.
++    std::process::Command::new(explorer).raw_arg(format!("/select,\"{}\"", plain(path).display())).spawn()?;
++  }
++  #[cfg(target_os = "macos")]
++  std::process::Command::new("open").arg("-R").arg(path).spawn()?;
++  #[cfg(not(any(target_os = "windows", target_os = "macos")))]
++  std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(path)).spawn()?;
++  Ok(())
++}
++
++#[tauri::command]
++pub fn reveal_recording(app: tauri::AppHandle, recording_id: String) -> Result<(), String> {
++  uuid::Uuid::parse_str(&recording_id).map_err(|_| "Invalid recording ID.")?;
++  let folder = app.path().app_data_dir().map_err(|_| "Vault location is unavailable.")?.join("recordings");
++  let path = find_recording(&folder, &recording_id).ok_or("This recording's audio file is not in the vault folder.")?;
++  open_with_selection(&path).map_err(|_| "Could not open the file manager.".to_string())
++}
++
++#[cfg(test)]
++mod tests {
++  use super::*;
++
++  #[test]
++  fn finds_only_the_recordings_own_audio_file_in_the_folder() {
++    let vault = tempfile::tempdir().unwrap();
++    let id = "51ac305c-fade-48ba-b086-9e68f00295ad";
++    std::fs::write(vault.path().join(format!("{id}.m4a")), b"audio").unwrap();
++    std::fs::write(vault.path().join(format!("{id}.txt")), b"not audio").unwrap();
++    std::fs::create_dir(vault.path().join("originals")).unwrap();
++    let found = find_recording(vault.path(), id).unwrap();
++    assert_eq!(found.file_name().unwrap(), format!("{id}.m4a").as_str());
++    assert!(find_recording(vault.path(), "72be6824-952b-42e8-b9c2-16cf07084e6a").is_none());
++    assert!(find_recording(&vault.path().join("missing"), id).is_none());
++  }
++
++  #[test]
++  fn plain_paths_drop_only_the_local_verbatim_prefix() {
++    assert_eq!(plain(Path::new(r"\\?\C:\Vault\a.m4a")), PathBuf::from(r"C:\Vault\a.m4a"));
++    assert_eq!(plain(Path::new(r"\\?\UNC\server\share\a.m4a")), PathBuf::from(r"\\?\UNC\server\share\a.m4a"));
++  }
++}
+diff --git a/web/src/i18n/fr/workspace.ts b/web/src/i18n/fr/workspace.ts
+index 9f1af0d..94c963a 100644
+--- a/web/src/i18n/fr/workspace.ts
++++ b/web/src/i18n/fr/workspace.ts
+@@ -42,6 +42,7 @@ export const workspace: Record<string, string> = {
+   'Edit tags': 'Modifier les tags',
+   'Edit recording': 'Modifier l’enregistrement',
+   'Ask AI': 'Demander à l’IA',
++  'Show in folder': 'Afficher dans le dossier',
+   'Load more recordings': 'Charger plus d’enregistrements',
+   'Select a recording': 'Sélectionnez un enregistrement',
+   'Rename collection': 'Renommer la collection',
+diff --git a/web/src/pages/Dashboard.tsx b/web/src/pages/Dashboard.tsx
+index 22823ec..a18de37 100644
+--- a/web/src/pages/Dashboard.tsx
++++ b/web/src/pages/Dashboard.tsx
+@@ -34,7 +34,9 @@ import {
+   ChevronDown,
+   Check,
+   Tags,
++  FolderOpen,
+ } from "@/components/icons";
++import { getRuntime } from "@/lib/runtime";
+ import * as Dialog from "@radix-ui/react-dialog";
+ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+ import * as ContextMenu from "@radix-ui/react-context-menu";
+@@ -209,6 +211,16 @@ export function Dashboard() {
+       setError((e as Error).message);
+     }
+   };
++  /** Desktop only: opens the file manager on the vault folder with this recording's audio selected. */
++  const desktop = getRuntime().mode === "desktop";
++  const reveal = async (id: string) => {
++    try {
++      const { invoke } = await import("@tauri-apps/api/core");
++      await invoke("reveal_recording", { recordingId: id });
++    } catch (e) {
++      setError(e instanceof Error ? e.message : String(e));
++    }
++  };
+   /** Same as the recording page's "Move to Trash": recoverable from Trash for 30 days. */
+   const trash = async (id: string) => {
+     if (!window.confirm(t("Move this recording to Trash for 30 days?"))) return;
+@@ -517,6 +529,11 @@ export function Dashboard() {
+                             >
+                               <MessageSquare />{t("Ask AI")}
+                             </DropdownMenu.Item>
++                            {desktop && (
++                              <DropdownMenu.Item onSelect={() => void reveal(row.id)}>
++                                <FolderOpen />{t("Show in folder")}
++                              </DropdownMenu.Item>
++                            )}
+                             <DropdownMenu.Item className="danger" onSelect={() => void trash(row.id)}>
+                               <Trash2 />{t("Move to Trash")}
+                             </DropdownMenu.Item>
+@@ -534,6 +551,7 @@ export function Dashboard() {
+                     <CollectionContextSubmenu {...collectionMenu(row)} />
+                     <ContextMenu.Item onSelect={() => navigate(`/recording/${row.id}`)}><Pencil />{t("Edit recording")}</ContextMenu.Item>
+                     <ContextMenu.Item onSelect={() => navigate(`/ai?recording=${row.id}`)}><MessageSquare />{t("Ask AI")}</ContextMenu.Item>
++                    {desktop && <ContextMenu.Item onSelect={() => void reveal(row.id)}><FolderOpen />{t("Show in folder")}</ContextMenu.Item>}
+                     <ContextMenu.Item className="danger" onSelect={() => void trash(row.id)}><Trash2 />{t("Move to Trash")}</ContextMenu.Item>
+                   </ContextMenu.Content>
+                 </ContextMenu.Portal>
