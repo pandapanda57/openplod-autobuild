@@ -1,0 +1,442 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:42:38 -0800
+Subject: [PATCH 2/5] Add a verified "Delete from recorder" for imported Plaud
+ recordings
+
+Deletes one recording from the Note Pro only after the vault copy checks out:
+imported from this recorder and session, still active, playable file present,
+and the kept device original matches the recorder's size and the SHA-256
+recorded at import. Lists again afterwards to confirm it is gone. The API
+route accepts requests from this computer only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/api/plaud.ts               | 25 ++++++++++-
+ src/sync/plaud-delete.test.ts  | 79 ++++++++++++++++++++++++++++++++++
+ src/sync/plaud-delete.ts       | 58 +++++++++++++++++++++++++
+ src/sync/plaud-direct.ts       | 24 ++++++++++-
+ src/sync/plaud-protocol.ts     | 18 +++++++-
+ src/sync/plaud-transfer.ts     | 17 +++++++-
+ web/src/i18n/fr/devices.ts     |  7 +++
+ web/src/lib/api.ts             |  7 +++
+ web/src/pages/DesktopPlaud.tsx | 30 +++++++++++--
+ 9 files changed, 256 insertions(+), 9 deletions(-)
+ create mode 100644 src/sync/plaud-delete.test.ts
+ create mode 100644 src/sync/plaud-delete.ts
+
+diff --git a/src/api/plaud.ts b/src/api/plaud.ts
+index 2e1f66e..7ac6e3f 100644
+--- a/src/api/plaud.ts
++++ b/src/api/plaud.ts
+@@ -8,13 +8,13 @@ import { basename, resolve } from 'node:path';
+ import { db, sqlite } from '../db/client';
+ import { PlaudAutoImport } from '../sync/plaud-auto-import';
+ import { recordings, userSettings } from '../db/schema';
+-import { eq } from 'drizzle-orm';
++import { and, eq } from 'drizzle-orm';
+ import { configuredSyncPath, fingerprintFile, importRecordingFile, incomingDirectory, safeFilename } from '../library/recording-library';
+ import { queueRecordingProcessing } from '../library/processing';
+ import { saveGeneratedTranscript } from '../library/transcript-history';
+ import { FolderWatcher } from '../sync/folder-watcher';
+ import { scanDesktopPlaud } from '../sync/desktop-plaud';
+-import { cancelDirectPlaud, directPlaudConfigured, importDirectPlaudRecording, readDirectPlaudRecordings } from '../sync/plaud-direct';
++import { cancelDirectPlaud, deleteDirectPlaudRecording, directPlaudConfigured, importDirectPlaudRecording, readDirectPlaudRecordings } from '../sync/plaud-direct';
+ import { readDeviceCredentials } from '../sync/plaud-device-auth';
+ import { isBluetoothIdentifier } from '../sync/plaud-bridge';
+ import { detectPlaudEnvironment, type PlaudEnvironment } from '../sync/plaud-environment';
+@@ -95,6 +95,27 @@ app.get('/device-import/:id', c => {
+ });
+ app.post('/device-cancel', c => { cancelDirectPlaud(); return c.json({ success: true }); });
+ 
++// Deleting the recorder's copy is irreversible, so it is allowed only from this computer and
++// only for a recording whose vault copy verifies (see verifyVaultCopy).
++app.post('/device-delete', async c => {
++  c.header('Cache-Control', 'no-store');
++  if (!localOwner(c)) return c.json({ success: false, error: 'Deleting from the recorder must happen on this computer.' }, 403);
++  let body: { sessionId?: unknown; confirm?: unknown };
++  try { body = await c.req.json(); } catch { body = {}; }
++  if (body.confirm !== true || !Number.isSafeInteger(body.sessionId)) return c.json({ success: false, error: 'A session ID and delete confirmation are required' }, 400);
++  if (importJob?.state === 'running') return c.json({ success: false, error: 'A Plaud import is running. Delete after it finishes.' }, 409);
++  try {
++    const result = await deleteDirectPlaudRecording(body.sessionId as number, async sourceRecordingId => {
++      const rows = await db.select({ id: recordings.id, filePath: recordings.filePath, sourceRecordingId: recordings.sourceRecordingId, retentionState: recordings.retentionState })
++        .from(recordings).where(and(eq(recordings.sourceProvider, 'plaud'), eq(recordings.sourceRecordingId, sourceRecordingId)));
++      return rows.find(row => row.retentionState === 'active') ?? rows[0];
++    });
++    return c.json({ success: true, data: result });
++  } catch (error) {
++    return c.json({ success: false, error: error instanceof Error ? error.message : 'Delete from the recorder failed' }, 409);
++  }
++});
++
+ // ---------------------------------------------------------------------------
+ // Cloud transfer
+ //
+diff --git a/src/sync/plaud-delete.test.ts b/src/sync/plaud-delete.test.ts
+new file mode 100644
+index 0000000..238ce32
+--- /dev/null
++++ b/src/sync/plaud-delete.test.ts
+@@ -0,0 +1,79 @@
++import { afterEach, beforeEach, expect, test } from 'bun:test';
++import { createHash } from 'node:crypto';
++import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { buildDeleteRequest, parseDeleteReply } from './plaud-protocol';
++import { deletePlaudSession } from './plaud-transfer';
++import { verifyVaultCopy, type VaultRecording } from './plaud-delete';
++
++const serial = '0011223344556677';
++const session = { sessionId: 1794594645, size: 6, scene: 0, timezone: 0 };
++const original = Buffer.from([1, 2, 3, 4, 5, 6]);
++let library = '';
++let recording: VaultRecording;
++
++function reply(sessionId: number, status: number) {
++  const packet = Buffer.alloc(8);
++  packet[0] = 1; packet.writeUInt16LE(31, 1); packet.writeUInt32LE(sessionId, 3); packet[7] = status;
++  return packet;
++}
++
++beforeEach(async () => {
++  library = await mkdtemp(join(tmpdir(), 'openplod-delete-'));
++  recording = { id: 'rec-1', filePath: join(library, 'rec-1.m4a'), sourceRecordingId: `${serial}:${session.sessionId}`, retentionState: 'active' };
++  await writeFile(recording.filePath, Buffer.from('audio'));
++  const originals = join(library, 'originals', recording.id);
++  await mkdir(originals, { recursive: true });
++  await writeFile(join(originals, 'device-original.plaud'), original);
++  await writeFile(join(originals, 'provenance.json'), JSON.stringify({
++    serial, session, originalSha256: createHash('sha256').update(original).digest('hex'),
++  }));
++});
++afterEach(async () => { await rm(library, { recursive: true, force: true }); });
++
++test('delete request carries the session ID little-endian after opcode 30', () => {
++  expect(buildDeleteRequest(0x01020304).toString('hex')).toBe('011e0004030201');
++  expect(() => buildDeleteRequest(-1)).toThrow();
++  expect(parseDeleteReply(reply(7, 0))).toEqual({ sessionId: 7, status: 0 });
++  expect(() => parseDeleteReply(Buffer.from('011f00', 'hex'))).toThrow('Invalid delete response');
++});
++
++test('delete waits for the matching reply and skips unrelated packets', async () => {
++  const sent: Buffer[] = []; const packets = [Buffer.from('011a00', 'hex'), reply(7, 0)];
++  await deletePlaudSession({ write: async bytes => { sent.push(Buffer.from(bytes)); }, packet: async () => packets.shift()! }, 7);
++  expect(sent.map(bytes => bytes.toString('hex'))).toEqual(['011e0007000000']);
++});
++
++test('delete rejects a refusal, a reply for another recording, and a silent device', async () => {
++  const one = (packet: Buffer) => ({ write: async () => {}, packet: async () => packet });
++  await expect(deletePlaudSession(one(reply(7, 3)), 7)).rejects.toThrow('refused');
++  await expect(deletePlaudSession(one(reply(8, 0)), 7)).rejects.toThrow('different recording');
++  await expect(deletePlaudSession({ write: async () => {}, packet: async () => { throw new Error('Packet timeout'); } }, 7)).rejects.toThrow('timeout');
++});
++
++test('a whole, active vault copy passes verification', async () => {
++  await verifyVaultCopy({ serial, session, recording, libraryDirectory: library });
++});
++
++test('verification refuses anything short of a whole vault copy', async () => {
++  const check = (changes: Partial<{ recording: VaultRecording | undefined; size: number; serial: string }>) =>
++    verifyVaultCopy({ serial: changes.serial ?? serial, session: { ...session, size: changes.size ?? session.size },
++      recording: 'recording' in changes ? changes.recording : recording, libraryDirectory: library });
++  await expect(check({ recording: undefined })).rejects.toThrow('not been imported');
++  await expect(check({ recording: { ...recording, sourceRecordingId: `${serial}:1` } })).rejects.toThrow('not been imported');
++  await expect(check({ recording: { ...recording, retentionState: 'trash' } })).rejects.toThrow('Trash');
++  await expect(check({ size: 7 })).rejects.toThrow('vault copy has 6');
++  await expect(check({ serial: 'FFFFFFFFFFFFFFFF', recording: { ...recording, sourceRecordingId: `FFFFFFFFFFFFFFFF:${session.sessionId}` } })).rejects.toThrow('does not match');
++  await writeFile(join(library, 'originals', recording.id, 'device-original.plaud'), Buffer.from([9, 9, 9, 9, 9, 9]));
++  await expect(check({})).rejects.toThrow('changed since import');
++  await writeFile(recording.filePath, Buffer.alloc(0));
++  await expect(check({})).rejects.toThrow('missing or empty');
++});
++
++test('verification refuses when the original or import record is missing', async () => {
++  await rm(join(library, 'originals', recording.id, 'provenance.json'));
++  await expect(verifyVaultCopy({ serial, session, recording, libraryDirectory: library })).rejects.toThrow('import record');
++  await rm(join(library, 'originals', recording.id), { recursive: true });
++  await expect(verifyVaultCopy({ serial, session, recording, libraryDirectory: library })).rejects.toThrow('no copy');
++});
+diff --git a/src/sync/plaud-delete.ts b/src/sync/plaud-delete.ts
+new file mode 100644
+index 0000000..126fb1e
+--- /dev/null
++++ b/src/sync/plaud-delete.ts
+@@ -0,0 +1,58 @@
++import { createHash } from 'node:crypto';
++import { createReadStream } from 'node:fs';
++import { readFile, stat } from 'node:fs/promises';
++import { join } from 'node:path';
++import type { PlaudSessionEntry } from './plaud-protocol';
++
++/** The vault row a device recording was imported as. */
++export interface VaultRecording {
++  id: string;
++  filePath: string;
++  sourceRecordingId: string | null;
++  retentionState: string | null;
++}
++
++async function sha256(path: string): Promise<string> {
++  return new Promise((resolve, reject) => {
++    const hash = createHash('sha256');
++    createReadStream(path).on('data', chunk => hash.update(chunk)).on('error', reject).on('end', () => resolve(hash.digest('hex')));
++  });
++}
++
++async function fileSize(path: string): Promise<number | null> {
++  try { const info = await stat(path); return info.isFile() ? info.size : null; } catch { return null; }
++}
++
++/**
++ * Proves the vault holds a whole copy of this device recording before the device's copy is
++ * deleted. Throws with a plain reason when any check fails; deleting is then refused.
++ * Checks: imported from this recorder and session, still active (not in Trash), playable file
++ * present, and the device's encrypted original kept byte for byte (size and SHA-256 recorded
++ * at import time match, and the size still matches what the device lists now).
++ */
++export async function verifyVaultCopy(params: {
++  serial: string;
++  session: PlaudSessionEntry;
++  recording: VaultRecording | undefined;
++  libraryDirectory: string;
++}): Promise<void> {
++  const { serial, session, recording } = params;
++  const source = `${serial}:${session.sessionId}`;
++  if (!recording || recording.sourceRecordingId !== source) throw new Error('This recording has not been imported into the vault, so it stays on the recorder.');
++  if (recording.retentionState !== 'active') throw new Error('The vault copy is in Trash or being removed. Restore it before deleting the recorder copy.');
++  if (!((await fileSize(recording.filePath)) ?? 0)) throw new Error('The vault audio file is missing or empty, so the recorder copy is kept.');
++  const originals = join(params.libraryDirectory, 'originals', recording.id);
++  const original = join(originals, 'device-original.plaud');
++  const originalSize = await fileSize(original);
++  if (originalSize === null) throw new Error('The vault has no copy of the recorder\'s original file, so the recorder copy is kept.');
++  if (originalSize !== session.size) throw new Error(`The recorder lists ${session.size} bytes but the vault copy has ${originalSize}. The recorder copy is kept.`);
++  let provenance: { serial?: unknown; session?: { sessionId?: unknown; size?: unknown }; originalSha256?: unknown };
++  try { provenance = JSON.parse(await readFile(join(originals, 'provenance.json'), 'utf8')); }
++  catch { throw new Error('The vault\'s import record could not be read, so the recorder copy is kept.'); }
++  if (provenance.serial !== serial || provenance.session?.sessionId !== session.sessionId || provenance.session?.size !== session.size) {
++    throw new Error('The vault\'s import record does not match this recording. The recorder copy is kept.');
++  }
++  if (typeof provenance.originalSha256 !== 'string' || provenance.originalSha256 !== await sha256(original)) {
++    throw new Error('The vault copy of the original file has changed since import. The recorder copy is kept.');
++  }
++}
+diff --git a/src/sync/plaud-direct.ts b/src/sync/plaud-direct.ts
+index 926d58d..26bdb4c 100644
+--- a/src/sync/plaud-direct.ts
++++ b/src/sync/plaud-direct.ts
+@@ -4,7 +4,8 @@ import { dirname, join, resolve } from 'node:path';
+ import { PlaudConnection, type PlaudIdentity } from './plaud-connection';
+ import { PlaudTransport } from './plaud-transport';
+ import { decodePlaudAudio } from './plaud-audio';
+-import { downloadPlaudSession, listPlaudSessions, recordingHandshake } from './plaud-transfer';
++import { deletePlaudSession, downloadPlaudSession, listPlaudSessions, recordingHandshake } from './plaud-transfer';
++import { verifyVaultCopy, type VaultRecording } from './plaud-delete';
+ import { fingerprintFile, importRecordingFile } from '../library/recording-library';
+ import { openPlaudCheckpoint } from './plaud-checkpoint';
+ import { evaluateTailChecksum, TransferChecksumMismatch } from './transfer-checksum';
+@@ -69,6 +70,27 @@ export async function readDirectPlaudRecordings() {
+     sessions: await listPlaudSessions(connection), checkedAt: new Date().toISOString() }));
+ }
+ 
++/**
++ * Deletes one recording from the recorder, only after verifyVaultCopy proves the vault holds it
++ * whole, then lists again to confirm it is gone. Returns alreadyGone when the device no longer
++ * lists it (for example after a retry following a dropped connection).
++ */
++export async function deleteDirectPlaudRecording(sessionId: number,
++  findRecording: (sourceRecordingId: string) => Promise<VaultRecording | undefined>) {
++  if (!Number.isSafeInteger(sessionId) || sessionId < 0 || sessionId > 0xffffffff) throw new Error('Invalid Plaud session ID');
++  return withDevice(async (connection, identity) => {
++    const before = await listPlaudSessions(connection);
++    const target = before.find(session => session.sessionId === sessionId);
++    if (!target) return { sessionId, deleted: false, alreadyGone: true, remaining: before.length };
++    await verifyVaultCopy({ serial: identity.serial, session: target, libraryDirectory: resolve(process.env.OPENPLOD_LIBRARY_PATH || './data/recordings'),
++      recording: await findRecording(`${identity.serial}:${sessionId}`) });
++    await deletePlaudSession(connection, sessionId);
++    const after = await listPlaudSessions(connection);
++    if (after.some(session => session.sessionId === sessionId)) throw new Error('The recorder still lists this recording after the delete. Refresh and check before retrying.');
++    return { sessionId, deleted: true, alreadyGone: false, remaining: after.length };
++  });
++}
++
+ async function runAudioTool(command: string[]) {
+   const child = Bun.spawn(command, { stdout: 'pipe', stderr: 'ignore' });
+   const timer = setTimeout(() => child.kill(), 45000);
+diff --git a/src/sync/plaud-protocol.ts b/src/sync/plaud-protocol.ts
+index 76b48e0..c7bda14 100644
+--- a/src/sync/plaud-protocol.ts
++++ b/src/sync/plaud-protocol.ts
+@@ -1,5 +1,7 @@
+-// Interoperability framing verified against APK builders/parsers; no device writes here.
++// Interoperability framing verified against APK builders/parsers. The only device write is
++// deleteFile, sent solely by deleteDirectPlaudRecording after the vault copy is verified.
+ export const PLAUD_COMMAND = { handshake: 1, sessions: 26, download: 28, tail: 29,
++  deleteFile: 30, deleteFileReply: 31,
+   signature: 0xfe10, signatureAccepted: 0xfe11, publicKey: 0xfe12 } as const;
+ 
+ export function parseNoteProAdvertisement(data: Uint8Array) {
+@@ -49,6 +51,20 @@ export function buildDownloadRequest(options: { sessionId: number; offset: numbe
+   ]));
+ }
+ 
++/** syncFileDel in the APK: removes one finished recording from the device. */
++export function buildDeleteRequest(sessionId: number): Buffer {
++  return command(PLAUD_COMMAND.deleteFile, uint32(sessionId));
++}
++
++/** Reply to deleteFile on protocol 7 and later: session ID echoed at 3, status at 7 (0 = deleted). */
++export function parseDeleteReply(packet: Uint8Array) {
++  const bytes = Buffer.from(packet);
++  if (bytes.length < 8 || bytes[0] !== 1 || bytes.readUInt16LE(1) !== PLAUD_COMMAND.deleteFileReply) {
++    throw new Error('Invalid delete response');
++  }
++  return { sessionId: bytes.readUInt32LE(3), status: bytes[7]! };
++}
++
+ export function buildPreHandshakeChunks(opcode: number, payload: Uint8Array): Buffer[] {
+   const supported: number[] = [PLAUD_COMMAND.signature, PLAUD_COMMAND.publicKey];
+   if (!supported.includes(opcode)) {
+diff --git a/src/sync/plaud-transfer.ts b/src/sync/plaud-transfer.ts
+index 03c0680..d837081 100644
+--- a/src/sync/plaud-transfer.ts
++++ b/src/sync/plaud-transfer.ts
+@@ -1,4 +1,4 @@
+-import { buildDownloadRequest, buildHandshake, buildSessionRequest, parseSessionPage, type PlaudSessionEntry } from './plaud-protocol';
++import { PLAUD_COMMAND, buildDeleteRequest, buildDownloadRequest, buildHandshake, buildSessionRequest, parseDeleteReply, parseSessionPage, type PlaudSessionEntry } from './plaud-protocol';
+ 
+ export interface PlaudPackets {
+   write(packet: Uint8Array): Promise<void>;
+@@ -111,6 +111,21 @@ export async function listPlaudSessions(connection: PlaudPackets, protocol = 20)
+   throw new Error('Recording list timeout; device recording count is unknown');
+ }
+ 
++/** Sends one delete and waits for the matching reply. Callers must verify the vault copy first. */
++export async function deletePlaudSession(connection: PlaudPackets, sessionId: number) {
++  await connection.write(buildDeleteRequest(sessionId));
++  const deadline = Date.now() + 15000;
++  while (Date.now() < deadline) {
++    const packet = await connection.packet(deadline - Date.now());
++    if (packet.length < 3 || packet[0] !== 1 || packet.readUInt16LE(1) !== PLAUD_COMMAND.deleteFileReply) continue;
++    const reply = parseDeleteReply(packet);
++    if (reply.sessionId !== sessionId) throw new Error('Delete reply named a different recording');
++    if (reply.status !== 0) throw new Error(`The recorder refused to delete the recording (status ${reply.status})`);
++    return;
++  }
++  throw new Error('Delete confirmation timed out; refresh the recording list before retrying');
++}
++
+ export async function downloadPlaudSession(connection: PlaudPackets, session: PlaudSessionEntry,
+   options: { prefix?: Uint8Array; checkpoint?: (bytes: Buffer) => Promise<void> } = {}) {
+   const download = new PlaudDownload(session, options.prefix);
+diff --git a/web/src/i18n/fr/devices.ts b/web/src/i18n/fr/devices.ts
+index 38d43e1..ef0c6af 100644
+--- a/web/src/i18n/fr/devices.ts
++++ b/web/src/i18n/fr/devices.ts
+@@ -240,6 +240,13 @@ export const devices: Record<string, string> = {
+   'Open recording {id}': 'Ouvrir l’enregistrement {id}',
+   'Import recording {id}': 'Importer l’enregistrement {id}',
+   'Importing session {id}': 'Import de la session {id}',
++  'Deleting from recorder': 'Suppression sur l’enregistreur',
++  'Delete recording {id} from the recorder': 'Supprimer l’enregistrement {id} de l’enregistreur',
++  'Delete from recorder': 'Supprimer de l’enregistreur',
++  'Delete this recording from your Note Pro? OpenPlod first checks that the vault holds a whole copy. The recorder copy cannot be restored.': 'Supprimer cet enregistrement de votre Note Pro ? OpenPlod vérifie d’abord que le coffre en contient une copie complète. La copie de l’enregistreur ne pourra pas être restaurée.',
++  'Deleted from the recorder. The vault copy is kept.': 'Supprimé de l’enregistreur. La copie du coffre est conservée.',
++  'That recording was already gone from the recorder.': 'Cet enregistrement n’était déjà plus sur l’enregistreur.',
++  'Delete from the recorder failed': 'La suppression sur l’enregistreur a échoué',
+   'Saved recordings': 'Enregistrements sauvegardés',
+   'Stored in your desktop vault': 'Stockés dans le coffre de votre ordinateur',
+   'Open saved recordings': 'Ouvrir les enregistrements sauvegardés',
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index c1315ec..b34b76e 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -873,6 +873,13 @@ export const api = {
+     throw new Error('Import status timed out. Check the library before retrying.')
+   },
+   cancelDeviceOperation: () => fetchJSON('/plaud/device-cancel', { method: 'POST', signal: AbortSignal.timeout(10000) }),
++  deleteDeviceRecording: async (sessionId: number, signal?: AbortSignal): Promise<{ deleted: boolean; alreadyGone: boolean; remaining: number }> => {
++    const res = await fetchJSON<ApiEnvelope<{ deleted: boolean; alreadyGone: boolean; remaining: number }>>('/plaud/device-delete', {
++      method: 'POST', body: JSON.stringify({ sessionId, confirm: true }),
++      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(150000)]) : AbortSignal.timeout(150000),
++    })
++    return res.data
++  },
+ 
+   getPlaudIdentity: async (signal?: AbortSignal): Promise<PlaudIdentityStatus> => {
+     const res = await fetchJSON<ApiEnvelope<PlaudIdentityStatus>>('/plaud/identity', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(20000) })
+diff --git a/web/src/pages/DesktopPlaud.tsx b/web/src/pages/DesktopPlaud.tsx
+index 7538e38..2410ce8 100644
+--- a/web/src/pages/DesktopPlaud.tsx
++++ b/web/src/pages/DesktopPlaud.tsx
+@@ -1,6 +1,6 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+ import { Link } from 'react-router-dom'
+-import { AudioLines, Bluetooth, Check, CheckCircle2, Clock3, Download, FileAudio, FolderOpen, HardDrive, Loader2, Radio, RefreshCw, ShieldCheck, X } from "@/components/icons"
++import { AudioLines, Bluetooth, Check, CheckCircle2, Clock3, Download, FileAudio, FolderOpen, HardDrive, Loader2, Radio, RefreshCw, ShieldCheck, Trash2, X } from "@/components/icons"
+ import { Button } from '@/components/ui/button'
+ import { IconButton } from '@/components/ui/icon-button'
+ import { NoteDialog } from '@/components/NoteDialogs'
+@@ -16,7 +16,8 @@ const sessionDate = (session: DeviceRecording) => formatDate(session.sessionId *
+ 
+ export function DesktopPlaud() {
+   const [status, setStatus] = useState<PlaudStatus | null>(null)
+-  const [phase, setPhase] = useState<'idle' | 'scanning' | 'listing' | 'downloading' | 'cancelling'>('idle')
++  const [phase, setPhase] = useState<'idle' | 'scanning' | 'listing' | 'downloading' | 'deleting' | 'cancelling'>('idle')
++  const [deleteConfirmation, setDeleteConfirmation] = useState<DeviceRecording | null>(null)
+   const [error, setError] = useState('')
+   const [notice, setNotice] = useState('')
+   const [sessions, setSessions] = useState<DeviceRecording[] | null>(null)
+@@ -84,6 +85,22 @@ export function DesktopPlaud() {
+       if (active.current === controller && !cancelling.current) { active.current = null; if (mounted.current) { setPhase('idle'); setDownloading(null) } }
+     }
+   }
++  const removeFromDevice = async () => {
++    if (active.current || !deleteConfirmation) return
++    const session = deleteConfirmation
++    const controller = new AbortController(); active.current = controller
++    setDeleteConfirmation(null); setPhase('deleting'); setError(''); setNotice(''); setDownloading(session.sessionId)
++    try {
++      const result = await api.deleteDeviceRecording(session.sessionId, controller.signal)
++      if (controller.signal.aborted) return
++      setSessions(current => current?.filter(item => item.sessionId !== session.sessionId) ?? null)
++      setNotice(result.deleted ? t('Deleted from the recorder. The vault copy is kept.') : t('That recording was already gone from the recorder.'))
++    } catch (failure) {
++      if (mounted.current && !controller.signal.aborted) setError(failure instanceof Error ? failure.message : t('Delete from the recorder failed'))
++    } finally {
++      if (active.current === controller && !cancelling.current) { active.current = null; if (mounted.current) { setPhase('idle'); setDownloading(null) } }
++    }
++  }
+   const cancel = async () => {
+     if (cancelling.current) return
+     cancelling.current = true; setPhase('cancelling')
+@@ -94,7 +111,7 @@ export function DesktopPlaud() {
+   }
+ 
+   const access = sessions !== null
+-  const statusLabel = phase === 'cancelling' ? t('Cancelling') : phase === 'scanning' ? t('Searching nearby') : phase === 'listing' ? t('Reading device') : phase === 'downloading' ? t('Importing audio') : access ? t('Access verified') : status?.deviceDetected ? t('Device detected') : status ? t('Not detected') : t('Not connected')
++  const statusLabel = phase === 'cancelling' ? t('Cancelling') : phase === 'scanning' ? t('Searching nearby') : phase === 'listing' ? t('Reading device') : phase === 'downloading' ? t('Importing audio') : phase === 'deleting' ? t('Deleting from recorder') : access ? t('Access verified') : status?.deviceDetected ? t('Device detected') : status ? t('Not detected') : t('Not connected')
+   const states = [
+     { icon: Radio, name: t('Bluetooth discovery'), value: status ? status.deviceDetected ? t('Detected') : t('Not detected') : phase === 'scanning' ? t('Searching') : t('Not checked'), ok: !!status?.deviceDetected },
+     { icon: Bluetooth, name: t('Bluetooth connection'), value: access || status?.connectionVerified ? t('Verified') : t('Not verified'), ok: access || !!status?.connectionVerified },
+@@ -131,7 +148,8 @@ export function DesktopPlaud() {
+               <input type="checkbox" aria-label={t('Select recording {id}', { id: session.sessionId })} disabled={busy || !!session.recordingId} checked={selected.includes(session.sessionId)} onChange={event => setSelected(current => event.target.checked ? [...current, session.sessionId] : current.filter(id => id !== session.sessionId))} />
+               <FileAudio /><div className="plaud-session-name"><strong>{sessionDate(session)}</strong><small>{t('Session {id}', { id: session.sessionId })}</small></div><span className="plaud-session-size">{t('{value} KB', { value: Math.round(session.size / 1024) })}</span>
+               <span className="plaud-session-state" data-imported={!!session.recordingId}>{session.retentionState === 'trash' ? t('In Trash') : session.recordingId ? t('Imported') : t('New')}</span>
+-              {session.recordingId ? <Button asChild variant="ghost" size="icon"><Link title={t('Open recording')} aria-label={t('Open recording {id}', { id: session.sessionId })} to={`/recording/${session.recordingId}`}><FolderOpen /></Link></Button> : <IconButton label={t('Import recording {id}', { id: session.sessionId })} disabled={busy} onClick={() => setConfirmation([session])}>{downloading === session.sessionId ? <Loader2 className="animate-spin" /> : <Download />}</IconButton>}
++              {session.recordingId ? <><Button asChild variant="ghost" size="icon"><Link title={t('Open recording')} aria-label={t('Open recording {id}', { id: session.sessionId })} to={`/recording/${session.recordingId}`}><FolderOpen /></Link></Button>
++                {session.retentionState === 'active' && <IconButton label={t('Delete recording {id} from the recorder', { id: session.sessionId })} disabled={busy} onClick={() => setDeleteConfirmation(session)}>{phase === 'deleting' && downloading === session.sessionId ? <Loader2 className="animate-spin" /> : <Trash2 />}</IconButton>}</> : <IconButton label={t('Import recording {id}', { id: session.sessionId })} disabled={busy} onClick={() => setConfirmation([session])}>{downloading === session.sessionId ? <Loader2 className="animate-spin" /> : <Download />}</IconButton>}
+             </div>)}</div>
+           </>}
+         {phase === 'downloading' && <div className="plaud-import-progress" role="status"><Loader2 className="animate-spin" /><span>{t('Importing session {id}', { id: downloading ?? '' })}</span><Button variant="ghost" size="sm" onClick={() => void cancel()}><X />{t('Cancel')}</Button></div>}
+@@ -148,5 +166,9 @@ export function DesktopPlaud() {
+       <p className="plaud-confirm-copy">{t('Save the selected audio to your OpenPlod vault? Original recordings will stay on your Plaud.')}</p><ul className="plaud-confirm-list">{confirmation.map(session => <li key={session.sessionId}><FileAudio /><span>{sessionDate(session)}</span><small>{t('{value} KB', { value: Math.round(session.size / 1024) })}</small></li>)}</ul>
+       <footer><Button variant="ghost" onClick={() => setConfirmation(null)}><X />{t('Cancel')}</Button><Button onClick={() => void download()}><Download />{tn(confirmation.length, 'Import {count} recording', 'Import {count} recordings')}</Button></footer>
+     </NoteDialog>}
++    {deleteConfirmation && <NoteDialog title={t('Delete from recorder')} description={sessionDate(deleteConfirmation)} busy={false} onClose={() => setDeleteConfirmation(null)}>
++      <p className="plaud-confirm-copy">{t('Delete this recording from your Note Pro? OpenPlod first checks that the vault holds a whole copy. The recorder copy cannot be restored.')}</p><ul className="plaud-confirm-list"><li><FileAudio /><span>{sessionDate(deleteConfirmation)}</span><small>{t('{value} KB', { value: Math.round(deleteConfirmation.size / 1024) })}</small></li></ul>
++      <footer><Button variant="ghost" onClick={() => setDeleteConfirmation(null)}><X />{t('Cancel')}</Button><Button variant="destructive" onClick={() => void removeFromDevice()}><Trash2 />{t('Delete from recorder')}</Button></footer>
++    </NoteDialog>}
+   </div>
+ }

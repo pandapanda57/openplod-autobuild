@@ -1,0 +1,2 @@
+*.patch -text
+* text=auto eol=lf

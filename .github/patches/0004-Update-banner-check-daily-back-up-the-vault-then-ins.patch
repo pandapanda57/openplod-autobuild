@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:01:47 -0800
+Subject: [PATCH 4/5] Update banner: check daily, back up the vault, then
+ install the signed update
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ web/src/App.tsx                     |  2 ++
+ web/src/components/UpdateBanner.tsx | 51 +++++++++++++++++++++++++++++
+ web/src/components/UpdatePanel.tsx  | 10 +++---
+ web/src/i18n/fr/documents.ts        |  3 ++
+ web/src/lib/app-update.ts           | 32 ++++++++++++++++++
+ 5 files changed, 92 insertions(+), 6 deletions(-)
+ create mode 100644 web/src/components/UpdateBanner.tsx
+ create mode 100644 web/src/lib/app-update.ts
+
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 53f86a6..c1f560b 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -4,6 +4,7 @@ import { Layout } from '@/components/Layout'
+ import { Loader2 } from "@/components/icons"
+ import { RuntimeGate } from '@/components/RuntimeGate'
+ import { SharedAudioRouter } from '@/components/SharedAudioRouter'
++import { UpdateBanner } from '@/components/UpdateBanner'
+ import { t, useLocale } from '@/i18n'
+ 
+ const DevicesPage = lazy(() => import('@/pages/DevicesPage').then(module => ({ default: module.DevicesPage })))
+@@ -35,6 +36,7 @@ export default function App() {
+     <RuntimeGate>
+       <BrowserRouter key={locale} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+         <SharedAudioRouter />
++        <UpdateBanner />
+         <Suspense fallback={<PageFallback />}>
+           <Routes>
+             <Route element={<Layout />}>
+diff --git a/web/src/components/UpdateBanner.tsx b/web/src/components/UpdateBanner.tsx
+new file mode 100644
+index 0000000..009c798
+--- /dev/null
++++ b/web/src/components/UpdateBanner.tsx
+@@ -0,0 +1,51 @@
++import { useEffect, useRef, useState } from 'react'
++import type { Update } from '@tauri-apps/plugin-updater'
++import { Download, Loader2, X } from '@/components/icons'
++import { Button } from '@/components/ui/button'
++import { IconButton } from '@/components/ui/icon-button'
++import { backUpThenInstall, findUpdate, type InstallStage } from '@/lib/app-update'
++import { getRuntime } from '@/lib/runtime'
++import { t } from '@/i18n'
++
++const FIRST_CHECK_MS = 10_000
++const RECHECK_MS = 24 * 60 * 60 * 1000
++
++/** Checks for a signed update shortly after start and once a day; offers a one-click install. */
++export function UpdateBanner() {
++  const [update, setUpdate] = useState<Update | null>(null)
++  const [dismissed, setDismissed] = useState<string | null>(null)
++  const [stage, setStage] = useState<InstallStage | null>(null)
++  const [done, setDone] = useState(false)
++  const [error, setError] = useState('')
++  const busy = useRef(false)
++  const desktop = getRuntime().mode === 'desktop'
++
++  useEffect(() => {
++    if (!desktop) return
++    let stopped = false
++    const look = () => { if (!busy.current) void findUpdate().then(found => { if (!stopped && found) setUpdate(found) }).catch(() => undefined) }
++    const first = window.setTimeout(look, FIRST_CHECK_MS)
++    const daily = window.setInterval(look, RECHECK_MS)
++    return () => { stopped = true; window.clearTimeout(first); window.clearInterval(daily) }
++  }, [desktop])
++
++  if (!desktop || !update || dismissed === update.version) return null
++  const install = async () => {
++    busy.current = true; setError('')
++    try { await backUpThenInstall(update, setStage); setDone(true) }
++    catch (failure) { setError(failure instanceof Error ? failure.message : t('The update could not be installed. Your current version is unchanged.')) }
++    finally { busy.current = false; setStage(null) }
++  }
++  const progress = stage?.percent == null ? '' : ` ${stage.percent}%`
++  return <div role="status" className="flex flex-wrap items-center gap-2 border-b bg-muted/60 px-4 py-2 text-sm">
++    <span className="flex-1">
++      {done ? t('Update installed. Quit and reopen OpenPlod to finish.')
++        : stage?.stage === 'backup' ? t('Backing up your vault before updating…') + progress
++        : stage?.stage === 'download' ? t('Installing…') + progress
++        : error || t('OpenPlod {version} is available. Your vault is backed up automatically before it installs.', { version: update.version })}
++    </span>
++    {!done && !stage && <Button size="sm" onClick={() => void install()}><Download />{t('Install {version}', { version: update.version })}</Button>}
++    {stage && <Loader2 className="animate-spin" />}
++    {!stage && <IconButton label={t('Dismiss update message')} onClick={() => setDismissed(update.version)}><X /></IconButton>}
++  </div>
++}
+diff --git a/web/src/components/UpdatePanel.tsx b/web/src/components/UpdatePanel.tsx
+index aa05363..9687359 100644
+--- a/web/src/components/UpdatePanel.tsx
++++ b/web/src/components/UpdatePanel.tsx
+@@ -3,6 +3,7 @@ import type { Update } from '@tauri-apps/plugin-updater'
+ import { Download, Loader2, RefreshCw } from '@/components/icons'
+ import { Button } from '@/components/ui/button'
+ import { getRuntime } from '@/lib/runtime'
++import { backUpThenInstall } from '@/lib/app-update'
+ import { t } from '@/i18n'
+ 
+ type State = { kind: 'idle' } | { kind: 'checking' } | { kind: 'current' } | { kind: 'available'; version: string; notes: string }
+@@ -31,13 +32,10 @@ export function UpdatePanel() {
+   const install = async () => {
+     const update = pending.current
+     if (!update) return
+-    let total = 0, received = 0
+     setState({ kind: 'installing', percent: null })
+     try {
+-      await update.downloadAndInstall(event => {
+-        if (event.event === 'Started') total = event.data.contentLength ?? 0
+-        if (event.event === 'Progress') { received += event.data.chunkLength; setState({ kind: 'installing', percent: total ? Math.round(received / total * 100) : null }) }
+-      })
++      // Same path as the banner: vault backup first, then the signed package.
++      await backUpThenInstall(update, stage => setState({ kind: 'installing', percent: stage.stage === 'download' ? stage.percent : null }))
+       setState({ kind: 'installed' })
+     } catch (error) {
+       setState({ kind: 'error', message: error instanceof Error ? error.message : t('The update could not be installed. Your current version is unchanged.') })
+@@ -50,7 +48,7 @@ export function UpdatePanel() {
+     </div>
+     <p role="status" className="text-muted-foreground">
+       {state.kind === 'current' && t('OpenPlod is up to date.')}
+-      {state.kind === 'available' && t('Version {version} is available. Back up your vault before installing; the update replaces the app, not your data.', { version: state.version })}
++      {state.kind === 'available' && t('OpenPlod {version} is available. Your vault is backed up automatically before it installs.', { version: state.version })}
+       {state.kind === 'installing' && (state.percent === null ? t('Installing…') : t('Installing {percent}%', { percent: state.percent }))}
+       {state.kind === 'installed' && t('Update installed. Quit and reopen OpenPlod to finish.')}
+       {state.kind === 'error' && state.message}
+diff --git a/web/src/i18n/fr/documents.ts b/web/src/i18n/fr/documents.ts
+index 41befe8..7575807 100644
+--- a/web/src/i18n/fr/documents.ts
++++ b/web/src/i18n/fr/documents.ts
+@@ -483,6 +483,9 @@ export const documents: Record<string, string> = {
+   "Update installed. Quit and reopen OpenPlod to finish.": "Mise à jour installée. Quittez et rouvrez OpenPlod pour terminer.",
+   "Updated": "Mis à jour",
+   "Updates are not configured for this build.": "Les mises à jour ne sont pas configurées pour ce build.",
++  "OpenPlod {version} is available. Your vault is backed up automatically before it installs.": "OpenPlod {version} est disponible. Votre coffre est sauvegardé automatiquement avant l'installation.",
++  "Backing up your vault before updating…": "Sauvegarde de votre coffre avant la mise à jour…",
++  "Dismiss update message": "Fermer le message de mise à jour",
+   "Uploads": "Imports",
+   "Use at least 12 characters.": "Utilisez au moins 12 caractères.",
+   "Use this folder": "Utiliser ce dossier",
+diff --git a/web/src/lib/app-update.ts b/web/src/lib/app-update.ts
+new file mode 100644
+index 0000000..9ebda24
+--- /dev/null
++++ b/web/src/lib/app-update.ts
+@@ -0,0 +1,32 @@
++import type { Update } from '@tauri-apps/plugin-updater'
++import { vaultApi } from './vault-api'
++
++/**
++ * Desktop updates. The updater plugin verifies every package against the public key built into
++ * the app and refuses unsigned or tampered ones. Installing always makes a vault backup first and
++ * stops, leaving the app unchanged, if that backup fails.
++ */
++export async function findUpdate(): Promise<Update | null> {
++  const { check } = await import('@tauri-apps/plugin-updater')
++  return check()
++}
++
++export type InstallStage = { stage: 'backup'; percent: number | null } | { stage: 'download'; percent: number | null }
++
++export async function backUpThenInstall(update: Update, onStage: (stage: InstallStage) => void): Promise<string> {
++  onStage({ stage: 'backup', percent: null })
++  const started = await vaultApi.createBackup({})
++  const finished = await vaultApi.wait(started.id, operation => {
++    const progress = operation.progress
++    onStage({ stage: 'backup', percent: progress?.totalBytes ? Math.round(progress.bytes / progress.totalBytes * 100) : null })
++  })
++  if (finished.state !== 'complete') throw new Error(finished.error || 'The vault backup failed, so the update was not installed.')
++  const backupPath = String((finished.result as { path?: unknown } | undefined)?.path ?? '')
++  let total = 0, received = 0
++  onStage({ stage: 'download', percent: null })
++  await update.downloadAndInstall(event => {
++    if (event.event === 'Started') total = event.data.contentLength ?? 0
++    if (event.event === 'Progress') { received += event.data.chunkLength; onStage({ stage: 'download', percent: total ? Math.round(received / total * 100) : null }) }
++  })
++  return backupPath
++}

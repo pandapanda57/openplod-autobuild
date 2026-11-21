@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 11:57:02 -0800
+Subject: [PATCH 1/5] Fix Plaud import on Windows: don't truncate an
+ append-mode file
+
+openPlaudCheckpoint opened the resume file with 'a+' and then truncated
+it. Windows refuses to truncate a handle opened for append, so every
+direct Bluetooth import failed with "EPERM: operation not permitted,
+ftruncate". Open with 'r+' (or 'w+' when the file is new) and write each
+chunk at its explicit offset, as mobile-uploads.ts already does.
+
+The existing checkpoint test failed on Windows before this change; it
+passes now, and a new test covers a fresh download.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/sync/plaud-checkpoint.test.ts | 15 +++++++++++++++
+ src/sync/plaud-checkpoint.ts      |  7 +++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/sync/plaud-checkpoint.test.ts b/src/sync/plaud-checkpoint.test.ts
+index 336a9ef..5b5d190 100644
+--- a/src/sync/plaud-checkpoint.test.ts
++++ b/src/sync/plaud-checkpoint.test.ts
+@@ -19,3 +19,18 @@ test('checkpoint keeps prefix, truncates unconfirmed tail and appends each byte
+     expect(await readFile(path)).toEqual(Buffer.from([1, 2, 3, 4]));
+   } finally { await rm(directory, { recursive: true }); }
+ });
++
++test('checkpoint starts a fresh download and writes each chunk at its offset', async () => {
++  const directory = await mkdtemp(join(tmpdir(), 'openplod-checkpoint-'));
++  try {
++    const path = join(directory, 'audio.part');
++    const audio = Buffer.alloc(300_000, 7);
++    audio[0] = 1; audio[audio.length - 1] = 9;
++    const checkpoint = await openPlaudCheckpoint(path, 0);
++    try {
++      await checkpoint.save(audio.subarray(0, 120_000));
++      await checkpoint.save(audio);
++    } finally { await checkpoint.close(); }
++    expect(await readFile(path)).toEqual(audio);
++  } finally { await rm(directory, { recursive: true }); }
++});
+diff --git a/src/sync/plaud-checkpoint.ts b/src/sync/plaud-checkpoint.ts
+index 3a042c0..6435d83 100644
+--- a/src/sync/plaud-checkpoint.ts
++++ b/src/sync/plaud-checkpoint.ts
+@@ -1,14 +1,17 @@
++import { existsSync } from 'node:fs';
+ import { open } from 'node:fs/promises';
+ 
+ export async function openPlaudCheckpoint(path: string, prefixLength: number) {
+-  const file = await open(path, 'a+', 0o600);
++  // Not 'a+': Windows refuses to truncate a file opened for append (EPERM ftruncate).
++  const file = await open(path, existsSync(path) ? 'r+' : 'w+', 0o600);
+   let written = prefixLength;
+   try { await file.truncate(written); } catch (error) { await file.close(); throw error; }
+   return {
+     async save(bytes: Uint8Array) {
+       if (bytes.length < written) throw new Error('Plaud checkpoint cannot shrink');
+       while (written < bytes.length) {
+-        const result = await file.write(bytes.subarray(written));
++        const rest = bytes.subarray(written);
++        const result = await file.write(rest, 0, rest.length, written);
+         if (!result.bytesWritten) throw new Error('Plaud checkpoint write made no progress');
+         written += result.bytesWritten;
+       }

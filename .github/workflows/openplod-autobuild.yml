@@ -1,0 +1,302 @@
+name: OpenPlod auto-build
+
+# Once a day: take the newest official OpenPlod release, apply the patches in .github/patches,
+# update everything (newest Bun and Rust; npm packages and Rust crates at least MIN_RELEASE_AGE
+# old, security fixes at once), then test, scan, build, sign and publish. The app's own updater
+# reads latest.json from this repository's newest release.
+#   - Nothing changed since the last release -> nothing is published.
+#   - Any check fails -> nothing is published and an issue is opened (GitHub emails the owner).
+# Safety: no third-party actions; GitHub's own actions are pinned to commit SHAs. The build job
+# runs updated dependency code but holds no secrets and can only read. Signing happens in a
+# separate job on a fresh machine, with a pinned signing tool, using the "release" environment.
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build and publish even if nothing changed'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: openplod-autobuild
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: RemiPelloux/OpenPlod
+  MIN_RELEASE_AGE: '86400' # seconds: npm packages and crates must be at least a day old
+  SIGNER_VERSION: '2.12.4' # @tauri-apps/cli used only to sign; bump by hand after review
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      installer: ${{ steps.plan.outputs.installer }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NO_COLOR: '1'
+    steps:
+      - name: Get this repository (patches and scripts)
+        run: |
+          git config --global core.autocrlf false
+          git init -q autobuild
+          git -C autobuild fetch -q --depth 1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:GITHUB_SHA
+          git -C autobuild checkout -q FETCH_HEAD
+
+      - name: Get the newest official OpenPlod release
+        run: |
+          $tag = gh api "repos/$env:UPSTREAM/releases/latest" --jq .tag_name
+          if (-not $tag) { throw 'Could not read the official release' }
+          "OFFICIAL_TAG=$tag" >> $env:GITHUB_ENV
+          git clone -q --depth 1 --branch $tag "https://github.com/$env:UPSTREAM.git" openplod
+          Write-Host "Official release: $tag"
+
+      - name: Apply the patches
+        working-directory: openplod
+        run: |
+          foreach ($patch in Get-ChildItem ../autobuild/.github/patches/*.patch | Sort-Object Name) {
+            git apply --3way --whitespace=nowarn $patch.FullName
+            if ($LASTEXITCODE) { throw "Patch $($patch.Name) no longer applies to $env:OFFICIAL_TAG" }
+            Write-Host "applied $($patch.Name)"
+          }
+
+      - name: Install the newest Bun (checksum and signature checked)
+        run: |
+          $tag = gh api repos/oven-sh/bun/releases/latest --jq .tag_name
+          gh release download $tag --repo oven-sh/bun --pattern bun-windows-x64.zip --pattern SHASUMS256.txt --dir bun-download
+          $hash = (Get-FileHash bun-download/bun-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          if (-not (Select-String -Path bun-download/SHASUMS256.txt -Pattern "^$hash\s+bun-windows-x64.zip$" -Quiet)) { throw 'Bun checksum mismatch' }
+          Expand-Archive bun-download/bun-windows-x64.zip -DestinationPath bun
+          $signature = Get-AuthenticodeSignature bun/bun-windows-x64/bun.exe
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '^CN=Codeblog CORP,') { throw "Unexpected Bun signature: $($signature.Status) $($signature.SignerCertificate.Subject)" }
+          "$PWD/bun/bun-windows-x64" >> $env:GITHUB_PATH
+          Write-Host "Bun $tag"
+
+      - name: Install the newest stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Update npm packages (at least a day old; security fixes at once)
+        working-directory: openplod
+        run: |
+          foreach ($dir in '.', 'web') {
+            Add-Content -Path "$dir/bunfig.toml" -Value "`n[install]`nminimumReleaseAge = $env:MIN_RELEASE_AGE`n"
+            Push-Location $dir
+            bun update
+            if ($LASTEXITCODE) { throw "bun update failed in $dir" }
+            bun audit fix
+            bun install
+            if ($LASTEXITCODE) { throw "bun install failed in $dir" }
+            Pop-Location
+          }
+
+      - name: Update Rust crates (at least a day old)
+        working-directory: openplod
+        run: |
+          foreach ($dir in 'src-tauri', 'src-tauri/plaud-bridge') {
+            Copy-Item "$dir/Cargo.lock" "$dir/Cargo.lock.before"
+            cargo update --manifest-path "$dir/Cargo.toml"
+            if ($LASTEXITCODE) { throw "cargo update failed in $dir" }
+            bun ../autobuild/.github/scripts/cargo-age-gate.ts $dir "$dir/Cargo.lock.before" $env:MIN_RELEASE_AGE
+            if ($LASTEXITCODE) { throw "Rust release-age check failed in $dir" }
+            Remove-Item "$dir/Cargo.lock.before"
+          }
+
+      - name: Get the newest stable ffmpeg (LGPL build, checksum checked)
+        run: |
+          $names = gh api repos/BtbN/FFmpeg-Builds/releases/latest --jq '[.assets[].name]' | ConvertFrom-Json
+          $name = $names | Where-Object { $_ -match '^ffmpeg-n(\d+)\.(\d+)-latest-win64-lgpl-shared-\1\.\2\.zip$' } |
+            Sort-Object { [version]($_ -replace '^ffmpeg-n([\d.]+)-.*$', '$1') } | Select-Object -Last 1
+          if (-not $name) { throw 'No stable LGPL ffmpeg build found' }
+          gh release download latest --repo BtbN/FFmpeg-Builds --pattern $name --pattern checksums.sha256 --dir ffmpeg-download
+          $hash = (Get-FileHash "ffmpeg-download/$name" -Algorithm SHA256).Hash.ToLower()
+          if (-not (Select-String -Path ffmpeg-download/checksums.sha256 -SimpleMatch "$hash  $name" -Quiet)) { throw 'ffmpeg checksum mismatch' }
+          Expand-Archive "ffmpeg-download/$name" -DestinationPath ffmpeg-download/x
+          $top = Get-ChildItem ffmpeg-download/x -Directory | Select-Object -First 1
+          $dest = 'openplod/src-tauri/resources/ffmpeg'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item "$($top.FullName)/bin/ffmpeg.exe", "$($top.FullName)/bin/ffprobe.exe" $dest
+          Copy-Item "$($top.FullName)/bin/*.dll" $dest
+          Copy-Item "$($top.FullName)/LICENSE.txt" "$dest/LICENSE.txt"
+          $version = (& "$dest/ffmpeg.exe" -hide_banner -version | Select-Object -First 1)
+          if ($LASTEXITCODE -or -not $version) { throw 'Bundled ffmpeg does not run' }
+          "FFMPEG_VERSION=$version" >> $env:GITHUB_ENV
+          "FFMPEG_ZIP=$name" >> $env:GITHUB_ENV
+          Write-Host $version
+
+      - name: Decide whether anything changed
+        id: plan
+        working-directory: openplod
+        env:
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: bun ../autobuild/.github/scripts/plan.ts ../autobuild $env:OFFICIAL_TAG
+
+      - name: Check for known vulnerabilities
+        if: steps.plan.outputs.changed == 'true'
+        working-directory: openplod
+        run: |
+          New-Item -ItemType Directory -Force ../out | Out-Null
+          foreach ($dir in '.', 'web') {
+            Push-Location $dir
+            "### npm advisories ($dir)" | Add-Content ../out/notes-audit.md
+            (bun audit 2>&1 | Out-String) | Add-Content ../out/notes-audit.md
+            bun audit --production --audit-level=high
+            if ($LASTEXITCODE) { throw "High or critical advisory in a shipped npm package ($dir)" }
+            Pop-Location
+          }
+          bun ../autobuild/.github/scripts/osv-gate.ts ../autobuild/.github/osv-ignore.txt src-tauri/Cargo.lock src-tauri/plaud-bridge/Cargo.lock
+          if ($LASTEXITCODE) { throw 'Blocking Rust advisory' }
+
+      - name: Typecheck
+        if: steps.plan.outputs.changed == 'true'
+        working-directory: openplod
+        run: |
+          bun x tsc --noEmit
+          if ($LASTEXITCODE) { throw 'Typecheck failed (server)' }
+          Push-Location web; bun x tsc -b; $code = $LASTEXITCODE; Pop-Location
+          if ($code) { throw 'Typecheck failed (web)' }
+
+      - name: Test
+        if: steps.plan.outputs.changed == 'true'
+        working-directory: openplod
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg -y --no-progress | Out-Null; $env:PATH += ";C:\ProgramData\chocolatey\bin" }
+          bun ../autobuild/.github/scripts/run-tests.ts . | Tee-Object -FilePath ../out/notes-tests.txt
+          if ($LASTEXITCODE) { throw 'Tests failed' }
+
+      - name: Build the installer (unsigned here; no secrets in this job)
+        if: steps.plan.outputs.changed == 'true'
+        working-directory: openplod
+        run: |
+          bun run scripts/release-config.ts
+          bun ../autobuild/.github/scripts/set-release-config.ts src-tauri/tauri.release.conf.json "${{ steps.plan.outputs.version }}" ../autobuild/updater-public-key.txt $env:GITHUB_REPOSITORY
+          bun x tauri build --target x86_64-pc-windows-msvc --config src-tauri/tauri.release.conf.json --bundles nsis
+          if ($LASTEXITCODE) { throw 'Build failed' }
+
+      - name: Scan the build for credentials and collect release files
+        if: steps.plan.outputs.changed == 'true'
+        working-directory: openplod
+        run: |
+          $installer = Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe | Select-Object -First 1
+          bun ../autobuild/.github/scripts/scan-secrets.ts $installer.FullName src-tauri/target/x86_64-pc-windows-msvc/release/openplod.exe (Get-ChildItem src-tauri/binaries/*.exe).FullName
+          if ($LASTEXITCODE) { throw 'Credential found in the build' }
+          Copy-Item $installer.FullName "../out/${{ steps.plan.outputs.installer }}"
+          Copy-Item build-inputs.json ../out/
+          $bun = bun --version; $rust = rustc --version
+          @(
+            "Official OpenPlod $env:OFFICIAL_TAG with this repository's patches.",
+            "", "- Bun $bun", "- $rust",
+            "- Bundled $env:FFMPEG_VERSION (LGPL build $env:FFMPEG_ZIP from https://github.com/BtbN/FFmpeg-Builds ; source: https://github.com/FFmpeg/FFmpeg ; licence text in the app's ffmpeg folder)",
+            "- npm packages and Rust crates updated within OpenPlod's version ranges (at least a day old; security fixes at once)",
+            "", "Your vault is backed up automatically before the update installs. Builds are unsigned for Windows (SmartScreen may warn on a manual install).",
+            "", "<details><summary>Checks</summary>", "", '```', (Get-Content ../out/notes-tests.txt -Raw), (Get-Content ../out/notes-audit.md -Raw), '```', "</details>"
+          ) -join "`n" | Set-Content ../out/notes.md
+          Remove-Item ../out/notes-tests.txt, ../out/notes-audit.md
+
+      - name: Keep the release files for the publish job
+        if: steps.plan.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+      INSTALLER: ${{ needs.build.outputs.installer }}
+    steps:
+      - name: Get this repository (public key and scripts)
+        run: |
+          git init -q autobuild
+          git -C autobuild fetch -q --depth 1 "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git -C autobuild checkout -q FETCH_HEAD
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release
+
+      - name: Install the pinned signing tool only
+        run: npm install --prefix signer --no-save --ignore-scripts --no-audit --no-fund "@tauri-apps/cli@$SIGNER_VERSION"
+
+      - name: Sign the installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: signer/node_modules/.bin/tauri signer sign "release/$INSTALLER"
+
+      - name: Write latest.json and checksums
+        run: node autobuild/.github/scripts/release-files.mjs release "$INSTALLER" "$VERSION" "$TAG" "$GITHUB_REPOSITORY" autobuild/updater-public-key.txt release/notes.md
+
+      - name: Publish
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "OpenPlod $VERSION" --notes-file release/notes.md \
+            "release/$INSTALLER" "release/$INSTALLER.sig" release/latest.json release/SHA256SUMS.txt release/build-inputs.json
+
+  report:
+    needs: [build, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Open an issue (GitHub emails the owner)
+        run: |
+          TITLE="Auto-build failed"
+          if [ "$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq length)" = "0" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "Nothing was published. Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Close this issue once fixed; the next daily run tries again either way."
+          else
+            echo "An open issue already covers this."
+          fi
+
+  keep-alive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Keep the daily schedule running
+        # GitHub pauses schedules in public repositories after 60 days without a commit.
+        run: |
+          BRANCH="${{ github.event.repository.default_branch }}"
+          SHA=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" --jq .object.sha)
+          DATE=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$SHA" --jq .committer.date)
+          AGE=$(( ($(date +%s) - $(date -d "$DATE" +%s)) / 86400 ))
+          if [ "$AGE" -lt 45 ]; then echo "Last commit $AGE days ago"; exit 0; fi
+          TREE=$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$SHA" --jq .tree.sha)
+          NEW=$(gh api "repos/$GITHUB_REPOSITORY/git/commits" -f message="Keep the daily schedule running" -f tree="$TREE" -f "parents[]=$SHA" --jq .sha)
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH" -f sha="$NEW"

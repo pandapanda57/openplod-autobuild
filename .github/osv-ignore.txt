@@ -1,0 +1,5 @@
+# Rust advisories accepted on purpose. One ID per line; text after # is the reason.
+# Review this list whenever an entry gets a fix.
+RUSTSEC-2023-0071  # rsa Marvin timing attack: no fixed release exists; used only to decrypt locally on this computer, no remote oracle
+GHSA-wrw7-89jp-8q8g  # glib VariantStrIter unsoundness: Linux GTK crate, not compiled into the Windows build
+RUSTSEC-2024-0429  # same glib issue (RustSec ID)

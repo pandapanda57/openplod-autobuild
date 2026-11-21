@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 11:47:21 -0800
+Subject: [PATCH 3/5] Allow recorder delete only from the desktop app's own
+ session
+
+Loopback alone could be satisfied by a port-forwarded phone or a local script
+holding OPENPLOD_API_TOKEN (MCP). Require the desktop pairing principal too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/api/plaud-delete-route.test.ts | 14 ++++++++++++++
+ src/api/plaud.ts                   |  6 +++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+ create mode 100644 src/api/plaud-delete-route.test.ts
+
+diff --git a/src/api/plaud-delete-route.test.ts b/src/api/plaud-delete-route.test.ts
+new file mode 100644
+index 0000000..65fc042
+--- /dev/null
++++ b/src/api/plaud-delete-route.test.ts
+@@ -0,0 +1,14 @@
++import { expect, test } from 'bun:test';
++import plaud from './plaud';
++
++const post = (body: unknown, headers: Record<string, string> = {}) =>
++  plaud.request('/device-delete', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) });
++
++test('delete from the recorder is refused unless the desktop app calls over loopback', async () => {
++  // app.request has no socket, so the caller is never loopback: every request must be refused
++  // before any Bluetooth work starts, whatever the body says.
++  const refused = await post({ sessionId: 1794594645, confirm: true });
++  expect(refused.status).toBe(403);
++  expect((await refused.json()).error).toContain('desktop app');
++  expect((await post({ sessionId: 1, confirm: true }, { 'X-OpenPlod-Token': 'phone-token' })).status).toBe(403);
++});
+diff --git a/src/api/plaud.ts b/src/api/plaud.ts
+index 7ac6e3f..ac24f9a 100644
+--- a/src/api/plaud.ts
++++ b/src/api/plaud.ts
+@@ -2,6 +2,7 @@ import { Hono } from 'hono';
+ import { bodyLimit } from 'hono/body-limit';
+ import { getConnInfo } from 'hono/bun';
+ import { PlaudEnrollment } from '../sync/plaud-enrollment';
++import { principalOf } from './access';
+ import { loadIdentity } from '../sync/plaud-direct';
+ import { existsSync, mkdirSync } from 'node:fs';
+ import { basename, resolve } from 'node:path';
+@@ -99,7 +100,10 @@ app.post('/device-cancel', c => { cancelDirectPlaud(); return c.json({ success:
+ // only for a recording whose vault copy verifies (see verifyVaultCopy).
+ app.post('/device-delete', async c => {
+   c.header('Cache-Control', 'no-store');
+-  if (!localOwner(c)) return c.json({ success: false, error: 'Deleting from the recorder must happen on this computer.' }, 403);
++  // Only the desktop app itself (its pairing token over loopback), never a paired phone, a script
++  // or MCP using OPENPLOD_API_TOKEN, or a port-forwarded client that merely looks local.
++  const caller = principalOf(c)?.kind;
++  if (!localOwner(c) || (caller !== 'desktop' && caller !== 'open')) return c.json({ success: false, error: 'Deleting from the recorder must happen in the OpenPlod desktop app.' }, 403);
+   let body: { sessionId?: unknown; confirm?: unknown };
+   try { body = await c.req.json(); } catch { body = {}; }
+   if (body.confirm !== true || !Number.isSafeInteger(body.sessionId)) return c.json({ success: false, error: 'A session ID and delete confirmation are required' }, 400);

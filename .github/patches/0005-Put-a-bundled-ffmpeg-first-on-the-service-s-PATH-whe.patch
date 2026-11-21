@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 12:17:34 -0800
+Subject: [PATCH 5/5] Put a bundled ffmpeg first on the service's PATH when the
+ build ships one
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src-tauri/src/lib.rs | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 80c9df4..5c9bc86 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -8,8 +8,8 @@ mod desktop_exports;
+ use std::{fs, net::UdpSocket, path::PathBuf};
+ #[cfg(desktop)]
+ use std::sync::Mutex;
+-// Only the opt-in macOS Swift fallback resolves bundled resources.
+-#[cfg(all(desktop, target_os = "macos"))]
++// Bundled resources: the bundled ffmpeg folder, and the opt-in macOS Swift fallback.
++#[cfg(desktop)]
+ use tauri::path::BaseDirectory;
+ #[cfg(desktop)]
+ use tauri::RunEvent;
+@@ -80,6 +80,19 @@ fn ble_bridge_path() -> Option<PathBuf> {
+   path.is_file().then_some(path)
+ }
+ 
++/// The bundled `ffmpeg` resource folder, when this build ships one with both tools in it.
++#[cfg(desktop)]
++fn bundled_ffmpeg_dir(app: &tauri::App) -> Option<PathBuf> {
++  let directory = app.path().resolve("ffmpeg", BaseDirectory::Resource).ok()?;
++  // PATH entries must be plain paths; drop the Windows verbatim prefix (\\?\C:\...).
++  let directory = match directory.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
++    Some(plain) if !plain.starts_with("UNC\\") => PathBuf::from(plain),
++    _ => directory,
++  };
++  let exe = |name: &str| directory.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() });
++  (exe("ffmpeg").is_file() && exe("ffprobe").is_file()).then_some(directory)
++}
++
+ #[cfg(desktop)]
+ fn start_service(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+   let app_data_dir = app.path().app_data_dir()?;
+@@ -103,6 +116,21 @@ fn start_service(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+     Some(bridge) => command.env("OPENPLOD_BLE_BRIDGE", bridge),
+     None => command,
+   };
++  // A build that bundles ffmpeg/ffprobe puts them first on the service's PATH, so imports and
++  // transcription use the copy that build was tested with, whatever is installed system-wide.
++  let command = match bundled_ffmpeg_dir(app) {
++    Some(dir) => {
++      let mut paths = vec![dir];
++      if let Some(existing) = std::env::var_os("PATH") {
++        paths.extend(std::env::split_paths(&existing));
++      }
++      match std::env::join_paths(paths) {
++        Ok(joined) => command.env("PATH", joined),
++        Err(_) => command,
++      }
++    }
++    None => command,
++  };
+   // The macOS Swift helpers remain shipped as an opt-in fallback backend
+   // (`OPENPLOD_BLE_BACKEND=swift`); they are never selected automatically.
+   #[cfg(target_os = "macos")]
