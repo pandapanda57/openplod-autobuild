@@ -150,11 +150,12 @@ jobs:
         if: steps.plan.outputs.changed == 'true'
         working-directory: openplod
         run: |
-          New-Item -ItemType Directory -Force ../out | Out-Null
+          $notes = "$env:GITHUB_WORKSPACE/out/notes-audit.md"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/out" | Out-Null
           foreach ($dir in '.', 'web') {
             Push-Location $dir
-            "### npm advisories ($dir)" | Add-Content ../out/notes-audit.md
-            (bun audit 2>&1 | Out-String) | Add-Content ../out/notes-audit.md
+            "### npm advisories ($dir)" | Add-Content $notes
+            (bun audit 2>&1 | Out-String) | Add-Content $notes
             bun audit --production --audit-level=high
             if ($LASTEXITCODE) { throw "High or critical advisory in a shipped npm package ($dir)" }
             Pop-Location
