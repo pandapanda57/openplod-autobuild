@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 11:47:21 -0800
-Subject: [PATCH 3/5] Allow recorder delete only from the desktop app's own
+Subject: [PATCH 3/6] Allow recorder delete only from the desktop app's own
  session
 
 Loopback alone could be satisfied by a port-forwarded phone or a local script
@@ -35,7 +35,7 @@ index 0000000..65fc042
 +  expect((await post({ sessionId: 1, confirm: true }, { 'X-OpenPlod-Token': 'phone-token' })).status).toBe(403);
 +});
 diff --git a/src/api/plaud.ts b/src/api/plaud.ts
-index 7ac6e3f..ac24f9a 100644
+index 93391c9..3cb3f7d 100644
 --- a/src/api/plaud.ts
 +++ b/src/api/plaud.ts
 @@ -2,6 +2,7 @@ import { Hono } from 'hono';
@@ -46,7 +46,7 @@ index 7ac6e3f..ac24f9a 100644
  import { loadIdentity } from '../sync/plaud-direct';
  import { existsSync, mkdirSync } from 'node:fs';
  import { basename, resolve } from 'node:path';
-@@ -99,7 +100,10 @@ app.post('/device-cancel', c => { cancelDirectPlaud(); return c.json({ success:
+@@ -101,7 +102,10 @@ app.post('/device-cancel', c => { cancelDirectPlaud(); return c.json({ success:
  // only for a recording whose vault copy verifies (see verifyVaultCopy).
  app.post('/device-delete', async c => {
    c.header('Cache-Control', 'no-store');

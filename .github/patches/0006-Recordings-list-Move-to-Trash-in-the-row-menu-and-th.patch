@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:08:42 -0800
+Subject: [PATCH 6/6] Recordings list: "Move to Trash" in the row menu and the
+ right-click menu
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ web/src/pages/Dashboard.tsx | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/web/src/pages/Dashboard.tsx b/web/src/pages/Dashboard.tsx
+index ca1df8f..22823ec 100644
+--- a/web/src/pages/Dashboard.tsx
++++ b/web/src/pages/Dashboard.tsx
+@@ -209,6 +209,16 @@ export function Dashboard() {
+       setError((e as Error).message);
+     }
+   };
++  /** Same as the recording page's "Move to Trash": recoverable from Trash for 30 days. */
++  const trash = async (id: string) => {
++    if (!window.confirm(t("Move this recording to Trash for 30 days?"))) return;
++    try {
++      await api.trashRecording(id);
++      await load();
++    } catch (e) {
++      setError((e as Error).message);
++    }
++  };
+   const purge = async (id: string) => {
+     if (
+       !window.confirm(
+@@ -507,6 +517,9 @@ export function Dashboard() {
+                             >
+                               <MessageSquare />{t("Ask AI")}
+                             </DropdownMenu.Item>
++                            <DropdownMenu.Item className="danger" onSelect={() => void trash(row.id)}>
++                              <Trash2 />{t("Move to Trash")}
++                            </DropdownMenu.Item>
+                           </DropdownMenu.Content>
+                         </DropdownMenu.Portal>
+                       </DropdownMenu.Root>
+@@ -521,6 +534,7 @@ export function Dashboard() {
+                     <CollectionContextSubmenu {...collectionMenu(row)} />
+                     <ContextMenu.Item onSelect={() => navigate(`/recording/${row.id}`)}><Pencil />{t("Edit recording")}</ContextMenu.Item>
+                     <ContextMenu.Item onSelect={() => navigate(`/ai?recording=${row.id}`)}><MessageSquare />{t("Ask AI")}</ContextMenu.Item>
++                    <ContextMenu.Item className="danger" onSelect={() => void trash(row.id)}><Trash2 />{t("Move to Trash")}</ContextMenu.Item>
+                   </ContextMenu.Content>
+                 </ContextMenu.Portal>
+                 </ContextMenu.Root>

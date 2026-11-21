@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 11:42:38 -0800
-Subject: [PATCH 2/5] Add a verified "Delete from recorder" for imported Plaud
+Subject: [PATCH 2/6] Add a verified "Delete from recorder" for imported Plaud
  recordings
 
 Deletes one recording from the Note Pro only after the vault copy checks out:
@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/sync/plaud-delete.ts
 
 diff --git a/src/api/plaud.ts b/src/api/plaud.ts
-index 2e1f66e..7ac6e3f 100644
+index 7d8be65..93391c9 100644
 --- a/src/api/plaud.ts
 +++ b/src/api/plaud.ts
 @@ -8,13 +8,13 @@ import { basename, resolve } from 'node:path';
@@ -45,7 +45,7 @@ index 2e1f66e..7ac6e3f 100644
  import { readDeviceCredentials } from '../sync/plaud-device-auth';
  import { isBluetoothIdentifier } from '../sync/plaud-bridge';
  import { detectPlaudEnvironment, type PlaudEnvironment } from '../sync/plaud-environment';
-@@ -95,6 +95,27 @@ app.get('/device-import/:id', c => {
+@@ -97,6 +97,27 @@ app.get('/device-import/:id', c => {
  });
  app.post('/device-cancel', c => { cancelDirectPlaud(); return c.json({ success: true }); });
  
@@ -349,10 +349,10 @@ index 38d43e1..ef0c6af 100644
    'Stored in your desktop vault': 'Stockés dans le coffre de votre ordinateur',
    'Open saved recordings': 'Ouvrir les enregistrements sauvegardés',
 diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
-index c1315ec..b34b76e 100644
+index 83e0d34..8d86554 100644
 --- a/web/src/lib/api.ts
 +++ b/web/src/lib/api.ts
-@@ -873,6 +873,13 @@ export const api = {
+@@ -874,6 +874,13 @@ export const api = {
      throw new Error('Import status timed out. Check the library before retrying.')
    },
    cancelDeviceOperation: () => fetchJSON('/plaud/device-cancel', { method: 'POST', signal: AbortSignal.timeout(10000) }),

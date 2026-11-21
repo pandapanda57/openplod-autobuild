@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
 Date: Sat, 21 Nov 2026 12:01:47 -0800
-Subject: [PATCH 4/5] Update banner: check daily, back up the vault, then
+Subject: [PATCH 4/6] Update banner: check daily, back up the vault, then
  install the signed update
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

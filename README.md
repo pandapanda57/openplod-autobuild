@@ -15,6 +15,7 @@ What each build changes compared with official OpenPlod:
   - "Delete from recorder" for recordings whose vault copy is verified (size and SHA-256 of the kept original), desktop app only
   - an update banner that backs up the vault before installing
   - the bundled ffmpeg put first on the path of OpenPlod's background service
+  - "Move to Trash" in the recordings list's row menu and right-click menu
 - **Updater**: points at this repository and trusts only this repository's signing key.
 
 Before anything is published, every build must pass: the patches applying cleanly, OpenPlod's typecheck and tests (five test files that also fail on Windows in the official release are allowed to fail), no high or critical advisory in a shipped npm package, no blocking Rust advisory (`.github/osv-ignore.txt` lists the accepted ones with reasons), and a scan of the built files for credentials. A failed run opens an issue and publishes nothing.
