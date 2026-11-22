@@ -1,0 +1,903 @@
+Subject: [PATCH] Recordings list: actions where expected, select several, readable names, simpler navigation
+
+The row menu and right-click menu get Transcribe (or Transcribe again), Summarize and Create document.
+The preview's empty transcript offers Transcribe in place (the dialog opens there), and greyed-out AI
+buttons say why (no transcript yet, or no usable model for chat, with a link to Settings). Several
+recordings can be selected (Select mode, Ctrl-click, Shift-click) to transcribe, summarize, add to a
+collection or move to Trash together; the Delete key moves the selection (or the open recording) to
+Trash and Escape clears it. Trash gets Empty Trash. Recordings still named by their Plaud session
+number ("Plaud 1795000000") show when they were recorded instead, in the list, preview, recording
+page, Transcripts and AI Chat; this is display only, file names and titles are unchanged. The
+Transcripts preview keeps speaker labels. The sidebar has one Recordings entry (Home showed the same
+list), grouped under Library and Sources; API & MCP moves to Settings and the footer.
+---
+diff --git a/web/src/components/BatchTranscribe.tsx b/web/src/components/BatchTranscribe.tsx
+index 3ccf9ed..984d6e0 100644
+--- a/web/src/components/BatchTranscribe.tsx
++++ b/web/src/components/BatchTranscribe.tsx
+@@ -268,7 +268,7 @@ function DocumentBatchSetup({ recordings, estimate, busy, onCancel, onStart }: {
+       <fieldset className="batch-documents-list" disabled={busy}>
+         <legend>{t('{count} of {total} selected', { count, total: recordings.length })}</legend>
+         {recordings.map(row => (
+-          <label key={row.id}><input type="checkbox" checked={selected.has(row.id)} onChange={() => toggle(row.id)} />{row.title}</label>
++          <label key={row.id}><input type="checkbox" checked={selected.has(row.id)} onChange={() => toggle(row.id)} />{row.displayTitle}</label>
+         ))}
+       </fieldset>
+       {estimate.providerError
+diff --git a/web/src/components/JobProgress.tsx b/web/src/components/JobProgress.tsx
+index b7faee0..204ff1a 100644
+--- a/web/src/components/JobProgress.tsx
++++ b/web/src/components/JobProgress.tsx
+@@ -58,7 +58,7 @@ export function RecordingStateChip({ state, job, onRetry }: { state: RecordingSt
+   const percent = job && state === 'transcribing' ? jobProgress(job, now).percent : null
+   const tone = state === 'failed' ? 'border-destructive/40 text-destructive' : state === 'not-transcribed' ? 'text-muted-foreground' : 'border-primary/40 text-primary'
+   return (
+-    <span className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] ${tone}`} title={job?.error || undefined}>
++    <span className={`inline-flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] ${tone}`} title={job?.error || recordingStateLabel(state)}>
+       {(state === 'transcribing' || state === 'queued' || state === 'summarizing') && <Loader2 className="h-3 w-3 animate-spin" />}
+       {state === 'failed' && <AlertCircle className="h-3 w-3" />}
+       {recordingStateLabel(state)}{percent !== null ? ` ${percent}%` : ''}
+diff --git a/web/src/components/Layout.tsx b/web/src/components/Layout.tsx
+index 8b16bd1..071951e 100644
+--- a/web/src/components/Layout.tsx
++++ b/web/src/components/Layout.tsx
+@@ -8,7 +8,6 @@ import {
+   Folder,
+   FolderHeart,
+   HardDrive,
+-  Home,
+   Mic,
+   Moon,
+   NotebookPen,
+@@ -20,7 +19,6 @@ import {
+   Upload,
+   UserRound,
+   MessageSquare,
+-  Workflow,
+   Wand2,
+ } from "@/components/icons";
+ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+@@ -44,9 +42,9 @@ import { COLLECTIONS_EVENT } from "./RecordingCollections";
+ import { formatDate, t } from "@/i18n";
+ 
+ // Functions, not constants, so the labels follow the current language.
++// Home and Recordings showed the same list, so there is one Recordings entry (with the overview tiles).
+ const desktopNav = () => [
+-  { to: "/", icon: Home, label: t("Home") },
+-  { to: "/recordings", icon: FolderHeart, label: t("Recordings") },
++  { to: "/", icon: FolderHeart, label: t("Recordings") },
+   { to: "/transcripts", icon: FileText, label: t("Transcripts") },
+   { to: "/notes", icon: NotebookPen, label: t("Documents") },
+   { to: "/ai", icon: MessageSquare, label: t("AI Chat") },
+@@ -176,22 +174,24 @@ export function Layout() {
+             <Brand />
+           </div>
+           <nav className="sidebar-nav" aria-label={t("Main navigation")}>
++            <small className="px-3 pb-1 pt-2 text-[11px] uppercase tracking-wide text-muted-foreground">{t("Library")}</small>
+             {desktopNav().map(({ to, icon: Icon, label }) => (
+               <NavLink
+                 key={to}
+                 to={to}
+                 end={to === "/"}
+                 className={({ isActive }) =>
+-                  `nav-item ${isActive && !(to === "/recordings" && libraryView) ? "active" : ""}`
++                  `nav-item ${(isActive || (to === "/" && location.pathname === "/recordings" && !libraryView)) ? "active" : ""}`
+                 }
+               >
+                 <Icon aria-hidden="true" />
+                 <span>{label}</span>
+-                {to === "/recordings" && recordingCount !== null && (
++                {to === "/" && recordingCount !== null && (
+                   <small className="nav-count">{recordingCount}</small>
+                 )}
+               </NavLink>
+             ))}
++            <small className="px-3 pb-1 pt-4 text-[11px] uppercase tracking-wide text-muted-foreground">{t("Sources")}</small>
+             <NavLink
+               to="/import"
+               className={({ isActive }) =>
+@@ -218,15 +218,6 @@ export function Layout() {
+               <Smartphone />
+               <span>Android</span>
+             </Link>
+-            <NavLink
+-              to="/developer"
+-              className={({ isActive }) =>
+-                `nav-item ${isActive ? "active" : ""}`
+-              }
+-            >
+-              <Workflow />
+-              <span>API &amp; MCP</span>
+-            </NavLink>
+           </nav>
+           <div className="sidebar-actions">
+             <Link
+@@ -338,9 +329,9 @@ export function Layout() {
+                         notices.map((notice) => (
+                           <DropdownMenu.Item
+                             key={notice.id}
+-                            className="grid gap-0.5"
+                             onSelect={() => { if (notice.recordingId) navigate(`/recording/${notice.recordingId}`); else if (notice.kind === "imported") navigate("/"); }}
+                           >
++                            <div className="grid min-w-0 gap-0.5">
+                             <span className={`text-sm ${notice.read ? "" : "font-semibold"} ${notice.kind === "failed" ? "text-destructive" : ""}`}>
+                               {notice.kind === "transcribed" ? t("Transcript ready") : notice.kind === "failed" ? t("Transcription failed") : t("Recording imported")}
+                             </span>
+@@ -348,6 +339,7 @@ export function Layout() {
+                               {notice.kind === "imported" ? "" : notice.title}{notice.kind === "failed" && notice.detail ? `: ${notice.detail}` : ""}
+                             </span>
+                             <span className="text-[11px] text-muted-foreground">{formatDate(notice.at, { dateStyle: "medium", timeStyle: "short" })}</span>
++                            </div>
+                           </DropdownMenu.Item>
+                         ))
+                       )}
+diff --git a/web/src/components/NoteDialogs.tsx b/web/src/components/NoteDialogs.tsx
+index 72d48cf..e99589a 100644
+--- a/web/src/components/NoteDialogs.tsx
++++ b/web/src/components/NoteDialogs.tsx
+@@ -46,7 +46,7 @@ export function SaveTranscriptDialog({ recordingId, versionId, title, disabled }
+     {open && <SaveTranscriptForm recordingId={recordingId} versionId={versionId} title={title} onClose={() => setOpen(false)} />}</>
+ }
+ 
+-function SaveTranscriptForm({ recordingId, versionId, title, onClose }: {recordingId: string; versionId: string | null; title: string; onClose: () => void}) {
++export function SaveTranscriptForm({ recordingId, versionId, title, onClose }: {recordingId: string; versionId: string | null; title: string; onClose: () => void}) {
+   const navigate = useNavigate()
+   const [folders, setFolders] = useState<NoteFolder[]>([])
+   const [folderId, setFolderId] = useState('')
+diff --git a/web/src/components/RecordingPreview.tsx b/web/src/components/RecordingPreview.tsx
+index e7edf79..1d62159 100644
+--- a/web/src/components/RecordingPreview.tsx
++++ b/web/src/components/RecordingPreview.tsx
+@@ -29,6 +29,7 @@ import {
+   ListTree,
+   MessageSquare,
+   Code,
++  AudioLines,
+ } from "@/components/icons";
+ import { loadWaveform } from '@/lib/audio-loader';
+ import { IconButton } from './ui/icon-button';
+@@ -40,6 +41,8 @@ import { SaveTranscriptDialog } from "./NoteDialogs";
+ import { api, type Recording } from "@/lib/api";
+ import { activeJobFor, DATA_CHANGED, useActivity } from "@/lib/activity";
+ import { JobProgressPanel } from "./JobProgress";
++import { TranscribeDialog } from "./TranscribeDialog";
++import { textAiProblem, useTextAiSettings } from "@/lib/text-ai";
+ import { apiUrl, authenticatedHeaders, getRuntime } from "@/lib/runtime";
+ import {
+   exportDocument,
+@@ -99,6 +102,12 @@ export function RecordingPreview({
+   }, []);
+   const { jobs } = useActivity();
+   const job = activeJobFor(jobs, id);
++  const [transcribeOpen, setTranscribeOpen] = useState(false);
++  // Why the AI actions below cannot run yet: no transcript, or chat has no usable model.
++  const aiSettings = useTextAiSettings();
++  const aiReason = !recording ? null : !recording.transcriptText
++    ? t("AI actions need a transcript. Transcribe this recording first.")
++    : textAiProblem(aiSettings, "chat");
+   useEffect(() => {
+     let disposed = false;
+     api
+@@ -294,11 +303,11 @@ export function RecordingPreview({
+     <section className="recording-preview" aria-label={t("Selected recording")}>
+       <div className="preview-heading">
+         <div>
+-          <h2>{recording?.title || t("Loading recording...")}</h2>
++          <h2>{recording?.displayTitle || t("Loading recording...")}</h2>
+           <p>
+             <Clock3 />
+             {recording
+-              ? formatDate(recording.recordedAt, {
++              ? formatDate(recording.startedAt, {
+                   dateStyle: "medium",
+                   timeStyle: "short",
+                 })
+@@ -550,8 +559,8 @@ export function RecordingPreview({
+             <div className="preview-empty">
+               <FileAudio />
+               <p>{t("No transcript yet.")}</p>
+-              <Button onClick={() => navigate(`/recording/${id}`)}>
+-                <FileText />{t("Open transcription")}
++              <Button disabled={!recording} onClick={() => setTranscribeOpen(true)}>
++                <AudioLines />{t("Transcribe")}
+               </Button>
+             </div>
+           ))}
+@@ -662,12 +671,14 @@ export function RecordingPreview({
+         <div className="preview-ai-actions">
+           <button
+             disabled={!recording?.transcriptText}
++            title={aiReason ?? undefined}
+             onClick={() => ask(t("Summarize this meeting with source citations."))}
+           >
+             <AlignLeft />{t("Summary")}
+           </button>
+           <button
+             disabled={!recording?.transcriptText}
++            title={aiReason ?? undefined}
+             onClick={() =>
+               ask(
+                 t("Extract explicitly mentioned action items with source citations."),
+@@ -680,17 +691,30 @@ export function RecordingPreview({
+             <SaveTranscriptDialog
+               recordingId={id}
+               versionId={recording.transcriptVersionId ?? null}
+-              title={recording.title}
++              title={recording.displayTitle}
+               disabled={!recording.transcriptText}
+             />
+           )}
+         </div>
+-        {notice && (
++        {notice ? (
+           <p className="preview-notice" role="status">
+             {notice}
+           </p>
++        ) : recording && aiReason && !job && (
++          <p className="preview-notice">
++            {aiReason}{" "}
++            {recording.transcriptText && <Link className="underline" to="/settings">{t("Open Settings")}</Link>}
++          </p>
+         )}
+       </div>
++      {transcribeOpen && recording && (
++        <TranscribeDialog
++          recordingId={recording.id}
++          title={recording.displayTitle}
++          onClose={() => setTranscribeOpen(false)}
++          onQueued={() => onUpdated()}
++        />
++      )}
+     </section>
+   );
+ }
+diff --git a/web/src/components/RecordingTagsDialog.tsx b/web/src/components/RecordingTagsDialog.tsx
+index bd3bcf5..c2b5d04 100644
+--- a/web/src/components/RecordingTagsDialog.tsx
++++ b/web/src/components/RecordingTagsDialog.tsx
+@@ -52,7 +52,7 @@ export function RecordingTagsDialog({ recording, onSaved, onClose }: {
+   const title = useTitle && suggestion?.title ? suggestion.title : null
+   const changed = saved && (JSON.stringify(pendingTags) !== JSON.stringify(saved.tags) || title !== null)
+   const add = () => { setTags(pendingTags); setInput(''); inputRef.current?.focus() }
+-  return <NoteDialog title={t('Edit tags')} description={recording.title} onClose={onClose} busy={busy}>
++  return <NoteDialog title={t('Edit tags')} description={recording.displayTitle} onClose={onClose} busy={busy}>
+     <form onSubmit={async event => {
+       event.preventDefault()
+       if (!saved || !changed || loading || busy) return
+diff --git a/web/src/i18n/fr.ts b/web/src/i18n/fr.ts
+index 82ccd91..4880b73 100644
+--- a/web/src/i18n/fr.ts
++++ b/web/src/i18n/fr.ts
+@@ -3,6 +3,7 @@ import { studio } from './fr/studio'
+ import { documents } from './fr/documents'
+ import { devices } from './fr/devices'
+ import { pipeline } from './fr/pipeline'
++import { library } from './fr/library'
+ 
+ /** French UI strings, keyed by the English source string. Each area keeps its own file. */
+-export const fr: Record<string, string> = { ...workspace, ...studio, ...documents, ...devices, ...pipeline }
++export const fr: Record<string, string> = { ...workspace, ...studio, ...documents, ...devices, ...pipeline, ...library }
+diff --git a/web/src/i18n/fr/library.ts b/web/src/i18n/fr/library.ts
+new file mode 100644
+index 0000000..e3f6af6
+--- /dev/null
++++ b/web/src/i18n/fr/library.ts
+@@ -0,0 +1,33 @@
++/** French strings for the recordings list actions, selection, navigation groups and AI readiness hints. */
++export const library: Record<string, string> = {
++  'Library': 'Bibliothèque',
++  'AI actions need a transcript. Transcribe this recording first.': 'Les actions IA nécessitent une transcription. Transcrivez d’abord cet enregistrement.',
++  'Open Settings': 'Ouvrir les réglages',
++  'Add a {provider} API key in Settings, AI providers, or choose a local model there.': 'Ajoutez une clé API {provider} dans Réglages, Fournisseurs IA, ou choisissez-y un modèle local.',
++  'Choose an Ollama model in Settings, AI providers.': 'Choisissez un modèle Ollama dans Réglages, Fournisseurs IA.',
++  'Enter the custom endpoint address in Settings, AI providers.': 'Saisissez l’adresse du point de terminaison personnalisé dans Réglages, Fournisseurs IA.',
++  'Enter the model name for the custom endpoint in Settings, AI providers.': 'Saisissez le nom du modèle du point de terminaison personnalisé dans Réglages, Fournisseurs IA.',
++  'Clear selection': 'Effacer la sélection',
++  'Deleting': 'Suppression',
++  'Done': 'Terminé',
++  'Empty Trash': 'Vider la corbeille',
++  'Move {count} recording to Trash for 30 days?': 'Placer {count} enregistrement dans la corbeille pendant 30 jours ?',
++  'Move {count} recordings to Trash for 30 days?': 'Placer {count} enregistrements dans la corbeille pendant 30 jours ?',
++  'Move {count} selected to Trash': 'Placer les {count} sélectionnés dans la corbeille',
++  'Moving to Trash': 'Mise à la corbeille',
++  'Permanently delete {count} recording in Trash and its audio? This cannot be undone.': 'Supprimer définitivement {count} enregistrement de la corbeille et son audio ? Cette action est irréversible.',
++  'Permanently delete {count} recordings in Trash and their audio? This cannot be undone.': 'Supprimer définitivement {count} enregistrements de la corbeille et leur audio ? Cette action est irréversible.',
++  'Queueing': 'Mise en file',
++  'Select': 'Sélectionner',
++  'Select several recordings (or Ctrl-click, Shift-click)': 'Sélectionner plusieurs enregistrements (ou Ctrl-clic, Maj-clic)',
++  'Selected': 'Sélectionné',
++  'Selected recordings': 'Enregistrements sélectionnés',
++  'Summarize': 'Résumer',
++  'Transcribe these recordings first': 'Transcrivez d’abord ces enregistrements',
++  'Transcribe this recording first': 'Transcrivez d’abord cet enregistrement',
++  '{action} {done} of {total}...': '{action} {done} sur {total}...',
++  '{count} could not be processed. {details}': '{count} n’ont pas pu être traités. {details}',
++  '{count} selected': '{count} sélectionné(s)',
++  'API & MCP': 'API et MCP',
++  'Open API & MCP': 'Ouvrir API et MCP',
++}
+diff --git a/web/src/lib/activity.ts b/web/src/lib/activity.ts
+index d541912..8703e50 100644
+--- a/web/src/lib/activity.ts
++++ b/web/src/lib/activity.ts
+@@ -13,6 +13,11 @@ import { t } from '@/i18n'
+ 
+ export const DATA_CHANGED = 'openplod:data-changed'
+ 
++/** Tells lists, counts and open pages to reload (after a trash, restore, delete or import). */
++export function notifyDataChanged() {
++  window.dispatchEvent(new Event(DATA_CHANGED))
++}
++
+ export type ActivityJob = {
+   id: string
+   recordingId?: string
+diff --git a/web/src/lib/text-ai.ts b/web/src/lib/text-ai.ts
+new file mode 100644
+index 0000000..2eb56e2
+--- /dev/null
++++ b/web/src/lib/text-ai.ts
+@@ -0,0 +1,46 @@
++/**
++ * Whether summaries, documents and chat can run with the current AI settings, and if not, why.
++ * Used to explain greyed-out AI buttons instead of leaving them silently disabled.
++ */
++import { useEffect, useState } from 'react'
++import { aiSettingsApi, type AiSettings } from '@/lib/ai-settings'
++import { t } from '@/i18n'
++
++export type TextTask = 'analysis' | 'document' | 'chat'
++
++const PROVIDER_NAMES: Record<string, string> = { mistral: 'Mistral', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini', ollama: 'Ollama', custom: 'custom endpoint' }
++
++let cached: { at: number; value: Promise<AiSettings | null> } | null = null
++const CACHE_MS = 30000
++
++function loadSettings(): Promise<AiSettings | null> {
++  if (!cached || Date.now() - cached.at > CACHE_MS) cached = { at: Date.now(), value: aiSettingsApi.get().catch(() => null) }
++  return cached.value
++}
++
++/** Forget the cached settings (after they were saved). */
++export function invalidateTextAi() { cached = null }
++
++/** The reason a text AI task cannot run, or null when it is set up. */
++export function textAiProblem(settings: AiSettings | null, task: TextTask): string | null {
++  if (!settings) return null
++  const provider = settings[`${task}Provider`]
++  const model = settings[`${task}Model`]
++  if (provider === 'ollama' && !model) return t('Choose an Ollama model in Settings, AI providers.')
++  if (provider === 'custom' && !settings.customBaseUrl) return t('Enter the custom endpoint address in Settings, AI providers.')
++  if (provider === 'custom' && !model) return t('Enter the model name for the custom endpoint in Settings, AI providers.')
++  if (settings.textCapabilities?.[provider]?.requiresKey && !settings.credentials?.[`${provider}ApiKey`])
++    return t('Add a {provider} API key in Settings, AI providers, or choose a local model there.', { provider: PROVIDER_NAMES[provider] ?? provider })
++  return null
++}
++
++/** The AI settings for readiness checks; null while loading or when they cannot be read. */
++export function useTextAiSettings(): AiSettings | null {
++  const [settings, setSettings] = useState<AiSettings | null>(null)
++  useEffect(() => {
++    let live = true
++    void loadSettings().then(value => { if (live) setSettings(value) })
++    return () => { live = false }
++  }, [])
++  return settings
++}
+diff --git a/web/src/pages/AiPage.tsx b/web/src/pages/AiPage.tsx
+index 07496ea..1ab5b9a 100644
+--- a/web/src/pages/AiPage.tsx
++++ b/web/src/pages/AiPage.tsx
+@@ -7,7 +7,10 @@ import { Archive, ArrowUp, ChevronDown, Download, FileAudio, Loader2, MessageSqu
+ import { Button } from '@/components/ui/button'
+ import { IconButton } from '@/components/ui/icon-button'
+ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+-import { api, type TranscriptDocument } from '@/lib/api'
++import { api, displayRecordingName, type TranscriptDocument } from '@/lib/api'
++
++/** Shown name for a transcript's audio file (the recording time for Plaud session file names). */
++const fileLabel = (filename?: string | null) => filename ? displayRecordingName(filename) : undefined
+ import { aiRequest, askRecordings, conversationExport, type AiAnswer, type AiConversation, type AiConversationContext } from '@/lib/recording-ai'
+ import { exportDocument } from '@/lib/document-export'
+ import { knowledgeApi, recordingLink, type TopicCandidate, type TopicSummary } from '@/lib/knowledge'
+@@ -132,7 +135,7 @@ export function AiPage() {
+     catch { setError(t('Clipboard unavailable. Export the answer as Markdown instead.')) }
+   }
+   const applyFollowUp = (text: string) => { setQuestion(text.slice(0, 4000)); composer.current?.focus() }
+-  const recordingTitle = (id: string, answer?: AiAnswer) => recordings.find(r => r.recordingId === id)?.filename || answer?.sources.find(source => source.recordingId === id)?.title || t('Recording')
++  const recordingTitle = (id: string, answer?: AiAnswer) => fileLabel(recordings.find(r => r.recordingId === id)?.filename) || answer?.sources.find(source => source.recordingId === id)?.title || t('Recording')
+   const consentText = provider === 'ollama'
+     ? selected.length
+       ? pinned.length ? t('Allow local Ollama to process selected transcripts and pinned recordings.') : t('Allow local Ollama to process selected transcripts.')
+@@ -149,7 +152,7 @@ export function AiPage() {
+         <h2>{t('Context')} <span>{selected.length}/12</span></h2>
+         {answers.length > 0 ? <p className="ai-context-fixed">{selected.length ? t('Conversation sources locked') : t('Answering from passages found across your recordings')}</p>
+           : !selected.length && <p className="ai-context-fixed">{t('No recordings selected: each question searches all your transcripts. Select recordings to answer from them only.')}</p>}
+-        <div className="ai-source-list">{recordings.map(recording => <div key={recording.recordingId} className="ai-source-row"><label className={`ai-source-choice ${selected.includes(recording.recordingId) ? 'selected' : ''}`}><input type="checkbox" checked={selected.includes(recording.recordingId)} disabled={!!stage || opening || answers.length > 0 || (!selected.includes(recording.recordingId) && selected.length >= 12)} onChange={e => { const checked = e.target.checked; fresh(); setSelected(rows => checked ? [...rows, recording.recordingId] : rows.filter(id => id !== recording.recordingId)) }} /><FileAudio /><span><strong>{recording.filename || t('Untitled recording')}</strong><small>{tn(recording.wordCount ?? 0, '{count} word', '{count} words')}{recording.durationSeconds ? ` / ${formatDuration(recording.durationSeconds)}` : ''}{pinned.includes(recording.recordingId) ? ` / ${t('pinned')}` : ''}</small></span></label><IconButton label={pinned.includes(recording.recordingId) ? t('Unpin {name}', { name: recording.filename || t('recording') }) : t('Pin {name} to this conversation', { name: recording.filename || t('recording') })} aria-pressed={pinned.includes(recording.recordingId)} disabled={!!stage || opening || contextBusy || (!pinned.includes(recording.recordingId) && pinned.length >= 12)} onClick={() => togglePin(recording.recordingId)}><BookmarkPlus /></IconButton></div>)}</div>
++        <div className="ai-source-list">{recordings.map(recording => <div key={recording.recordingId} className="ai-source-row"><label className={`ai-source-choice ${selected.includes(recording.recordingId) ? 'selected' : ''}`}><input type="checkbox" checked={selected.includes(recording.recordingId)} disabled={!!stage || opening || answers.length > 0 || (!selected.includes(recording.recordingId) && selected.length >= 12)} onChange={e => { const checked = e.target.checked; fresh(); setSelected(rows => checked ? [...rows, recording.recordingId] : rows.filter(id => id !== recording.recordingId)) }} /><FileAudio /><span><strong>{recording.filename ? displayRecordingName(recording.filename) : t('Untitled recording')}</strong><small>{tn(recording.wordCount ?? 0, '{count} word', '{count} words')}{recording.durationSeconds ? ` / ${formatDuration(recording.durationSeconds)}` : ''}{pinned.includes(recording.recordingId) ? ` / ${t('pinned')}` : ''}</small></span></label><IconButton label={pinned.includes(recording.recordingId) ? t('Unpin {name}', { name: recording.filename || t('recording') }) : t('Pin {name} to this conversation', { name: recording.filename || t('recording') })} aria-pressed={pinned.includes(recording.recordingId)} disabled={!!stage || opening || contextBusy || (!pinned.includes(recording.recordingId) && pinned.length >= 12)} onClick={() => togglePin(recording.recordingId)}><BookmarkPlus /></IconButton></div>)}</div>
+         {!loading && !recordings.length && <p className="ai-empty-copy">{t('No transcripts yet.')} <Link to="/">{t('Open recordings')}</Link></p>}
+         {loading && <Loader2 className="size-4 animate-spin" aria-label={t('Loading transcripts')} />}
+         {more && <Button variant="ghost" size="sm" disabled={loading} onClick={() => void loadMore()}>{loading ? <Loader2 className="animate-spin" /> : <ChevronDown />}{t('Load more recordings')}</Button>}
+@@ -197,7 +200,7 @@ export function AiPage() {
+         </div>
+         <form className="ai-composer" onSubmit={e => { e.preventDefault(); void send() }}>
+           {error && <p className="device-error" role="alert">{error}</p>}
+-          <div className="ai-selected-sources">{selected.slice(0, 3).map(id => <span key={id}><FileAudio /><span>{recordings.find(r => r.recordingId === id)?.filename || t('Saved recording source')}</span>{!answers.length && !stage && !opening && <IconButton type="button" label={t('Remove source {name}', { name: recordings.find(r => r.recordingId === id)?.filename || t('recording') })} onClick={() => setSelected(rows => rows.filter(value => value !== id))}><X /></IconButton>}</span>)}{selected.length > 3 && <small>+{selected.length - 3}</small>}{!selected.length && <small>{pinned.length ? t('All recordings + {count} pinned', { count: pinned.length }) : t('All recordings')}</small>}</div>
++          <div className="ai-selected-sources">{selected.slice(0, 3).map(id => <span key={id}><FileAudio /><span>{fileLabel(recordings.find(r => r.recordingId === id)?.filename) || t('Saved recording source')}</span>{!answers.length && !stage && !opening && <IconButton type="button" label={t('Remove source {name}', { name: fileLabel(recordings.find(r => r.recordingId === id)?.filename) || t('recording') })} onClick={() => setSelected(rows => rows.filter(value => value !== id))}><X /></IconButton>}</span>)}{selected.length > 3 && <small>+{selected.length - 3}</small>}{!selected.length && <small>{pinned.length ? t('All recordings + {count} pinned', { count: pinned.length }) : t('All recordings')}</small>}</div>
+           <div className="ai-input"><textarea ref={composer} aria-label={t('Question about your recordings')} placeholder={t('Ask about your recordings...')} rows={3} maxLength={4000} value={question} disabled={!!stage || opening} onChange={e => setQuestion(e.target.value)} />{stage ? <IconButton type="button" variant="outline" label={t('Cancel question')} onClick={() => active.current?.abort()}><Square /></IconButton> : <IconButton type="submit" variant="default" disabled={!consent || !question.trim() || loading || opening} label={t('Send question')}><ArrowUp /></IconButton>}</div>
+           <div className="ai-composer-footer"><label className="ai-consent"><input type="checkbox" checked={consent} disabled={!!stage || !provider} onChange={e => setConsent(e.target.checked)} /><span>{consentText}</span></label><span>{question.length}/4000</span></div>
+         </form>
+diff --git a/web/src/pages/Dashboard.tsx b/web/src/pages/Dashboard.tsx
+index 2b5612d..c5df62a 100644
+--- a/web/src/pages/Dashboard.tsx
++++ b/web/src/pages/Dashboard.tsx
+@@ -5,6 +5,8 @@ import {
+   useMemo,
+   useRef,
+   useState,
++  type KeyboardEvent as ReactKeyboardEvent,
++  type MouseEvent as ReactMouseEvent,
+ } from "react";
+ import {
+   Link,
+@@ -35,6 +37,11 @@ import {
+   Check,
+   Tags,
+   FolderOpen,
++  AudioLines,
++  AlignLeft,
++  FilePlus2,
++  Folder,
++  ListChecks,
+ } from "@/components/icons";
+ import { getRuntime } from "@/lib/runtime";
+ import * as Dialog from "@radix-ui/react-dialog";
+@@ -51,9 +58,10 @@ import { formatDate, t, tn } from "@/i18n";
+ import { BatchTranscribe } from '@/components/BatchTranscribe'
+ import { COLLECTIONS_EVENT, CollectionContextSubmenu, CollectionDropdownSubmenu, CollectionNameDialog } from '@/components/RecordingCollections'
+ import { knowledgeApi, type RecordingCollection } from '@/lib/knowledge'
+-import { activeJobFor, DATA_CHANGED, failedJobFor, recordingState, refreshActivity, useActivity } from '@/lib/activity'
++import { activeJobFor, DATA_CHANGED, failedJobFor, notifyDataChanged, recordingState, refreshActivity, useActivity } from '@/lib/activity'
+ import { RecordingStateChip } from '@/components/JobProgress'
+ import { TranscribeDialog } from '@/components/TranscribeDialog'
++import { SaveTranscriptForm } from '@/components/NoteDialogs'
+ 
+ export function Dashboard() {
+   const [recordings, setRecordings] = useState<Recording[]>([]),
+@@ -170,16 +178,16 @@ export function Dashboard() {
+           return (
+             (status === "all" || row.status === status) &&
+             (!search ||
+-              `${row.title} ${row.tags.join(" ")}`
++              `${row.title} ${row.displayTitle} ${row.tags.join(" ")}`
+                 .toLocaleLowerCase()
+                 .includes(search))
+           );
+         })
+         .sort((a, b) =>
+           sort === "title"
+-            ? a.title.localeCompare(b.title)
++            ? a.displayTitle.localeCompare(b.displayTitle)
+             : (sort === "oldest" ? 1 : -1) *
+-              (Date.parse(a.recordedAt) - Date.parse(b.recordedAt)),
++              (Date.parse(a.startedAt) - Date.parse(b.startedAt)),
+         ),
+     [recordings, source, starred, status, search, sort],
+   );
+@@ -190,6 +198,69 @@ export function Dashboard() {
+     if (window.matchMedia("(max-width: 1100px)").matches)
+       navigate(`/recording/${id}`);
+   };
++  // Selecting several recordings: Ctrl/Cmd-click toggles one, Shift-click selects a range, and in
++  // "Select" mode a plain click toggles. Escape clears; Delete moves the selection to Trash.
++  const [picked, setPicked] = useState<Set<string>>(new Set());
++  const [selectMode, setSelectMode] = useState(false);
++  const [bulkNotice, setBulkNotice] = useState("");
++  const [documentFor, setDocumentFor] = useState<Recording | null>(null);
++  const pickAnchor = useRef<string | null>(null);
++  useEffect(() => { setPicked(new Set()); setSelectMode(false); }, [retention, collectionId, starred]);
++  const pickedRows = filtered.filter((row) => picked.has(row.id));
++  const clickRow = (event: ReactMouseEvent, row: Recording) => {
++    if (event.shiftKey && pickAnchor.current) {
++      const ids = filtered.map((item) => item.id), from = ids.indexOf(pickAnchor.current), to = ids.indexOf(row.id);
++      if (from >= 0 && to >= 0) {
++        const range = ids.slice(Math.min(from, to), Math.max(from, to) + 1);
++        setPicked((current) => new Set([...current, ...range]));
++        return;
++      }
++    }
++    if (event.ctrlKey || event.metaKey || selectMode) {
++      pickAnchor.current = row.id;
++      setPicked((current) => { const next = new Set(current); if (next.has(row.id)) next.delete(row.id); else next.add(row.id); return next; });
++      return;
++    }
++    pickAnchor.current = row.id;
++    if (picked.size) setPicked(new Set());
++    choose(row.id);
++  };
++  /** Runs one action per recording in turn, reporting progress and failures in one line. */
++  const runBulk = async (rows: Recording[], label: string, act: (row: Recording) => Promise<void>) => {
++    const failures: string[] = [];
++    for (const [index, row] of rows.entries()) {
++      setBulkNotice(t("{action} {done} of {total}...", { action: label, done: index + 1, total: rows.length }));
++      try { await act(row); } catch (e) { failures.push(`${row.displayTitle}: ${(e as Error).message}`); }
++    }
++    setBulkNotice(failures.length ? failures.join(" · ") : "");
++    if (failures.length) setError(t("{count} could not be processed. {details}", { count: failures.length, details: failures.slice(0, 3).join(" · ") }));
++    refreshActivity();
++    notifyDataChanged();
++  };
++  const transcribeMany = (rows: Recording[]) => runBulk(rows, t("Queueing"), (row) => api.transcribe(row.id));
++  const summarizeMany = (rows: Recording[]) => runBulk(rows.filter((row) => row.hasTranscript), t("Summarizing"), (row) => api.summarize(row.id));
++  const trashMany = async (rows: Recording[]) => {
++    if (!rows.length || !window.confirm(tn(rows.length, "Move {count} recording to Trash for 30 days?", "Move {count} recordings to Trash for 30 days?"))) return;
++    await runBulk(rows, t("Moving to Trash"), (row) => api.trashRecording(row.id));
++    setPicked(new Set());
++  };
++  const addManyToCollection = async (rows: Recording[], collection: RecordingCollection) => {
++    try { await knowledgeApi.addToCollection(collection.id, rows.map((row) => row.id), collection.revision); collectionsChanged(); await load(); }
++    catch (e) { setError((e as Error).message); }
++  };
++  const emptyTrash = async () => {
++    if (!recordings.length || !window.confirm(tn(recordings.length, "Permanently delete {count} recording in Trash and its audio? This cannot be undone.", "Permanently delete {count} recordings in Trash and their audio? This cannot be undone."))) return;
++    await runBulk(recordings, t("Deleting"), (row) => api.purgeRecording(row.id));
++  };
++  const summarizeOne = (row: Recording) => runBulk([row], t("Summarizing"), (item) => api.summarize(item.id));
++  const onListKey = (event: ReactKeyboardEvent) => {
++    if (event.key === "Escape" && picked.size) { setPicked(new Set()); return; }
++    if (event.key !== "Delete" || retention !== "active") return;
++    const target = event.target as HTMLElement;
++    if (target.closest("input, textarea, select, [contenteditable=true]")) return;
++    const rows = picked.size ? pickedRows : filtered.filter((row) => row.id === activeId);
++    if (rows.length) { event.preventDefault(); void trashMany(rows); }
++  };
+   const moreRows = async () => {
+     const ticket = revision.current;
+     setLoading(true);
+@@ -213,7 +284,7 @@ export function Dashboard() {
+   const restore = async (id: string) => {
+     try {
+       await api.restoreRecording(id);
+-      await load();
++      notifyDataChanged();
+     } catch (e) {
+       setError((e as Error).message);
+     }
+@@ -233,7 +304,7 @@ export function Dashboard() {
+     if (!window.confirm(t("Move this recording to Trash for 30 days?"))) return;
+     try {
+       await api.trashRecording(id);
+-      await load();
++      notifyDataChanged();
+     } catch (e) {
+       setError((e as Error).message);
+     }
+@@ -247,7 +318,7 @@ export function Dashboard() {
+       return;
+     try {
+       await api.purgeRecording(id);
+-      await load();
++      notifyDataChanged();
+     } catch (e) {
+       setError((e as Error).message);
+     }
+@@ -323,13 +394,40 @@ export function Dashboard() {
+                 <Button variant="outline" size="sm" onClick={() => setNaming({ mode: "rename", collection: activeCollection })}><Pencil />{t("Rename")}</Button>
+                 <Button variant="ghost" size="sm" onClick={() => void deleteCollection(activeCollection)}><Trash2 />{t("Delete collection")}</Button>
+               </div>
++            ) : retention === "trash" ? (
++              recordings.length > 0 && (
++                <Button variant="ghost" size="sm" className="text-destructive" onClick={() => void emptyTrash()}>
++                  <Trash2 />{t("Empty Trash")}
++                </Button>
++              )
+             ) : (
+               <PlaudImportDialog />
+             )}
+           </header>
+-          {retention === "active" && (
++          {retention === "active" && picked.size > 0 ? (
++            <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-card px-3 py-2 text-sm" role="toolbar" aria-label={t("Selected recordings")}>
++              <strong className="mr-1">{tn(picked.size, "{count} selected", "{count} selected")}</strong>
++              <Button size="sm" variant="outline" onClick={() => void transcribeMany(pickedRows)}><AudioLines />{t("Transcribe")}</Button>
++              <Button size="sm" variant="outline" disabled={!pickedRows.some((row) => row.hasTranscript)} title={pickedRows.some((row) => row.hasTranscript) ? undefined : t("Transcribe these recordings first")} onClick={() => void summarizeMany(pickedRows)}><AlignLeft />{t("Summarize")}</Button>
++              {collections.length > 0 && (
++                <DropdownMenu.Root>
++                  <DropdownMenu.Trigger asChild><Button size="sm" variant="outline"><Folder />{t("Add to collection")}</Button></DropdownMenu.Trigger>
++                  <DropdownMenu.Portal>
++                    <DropdownMenu.Content className="action-menu" align="start" sideOffset={6}>
++                      {collections.map((collection) => (
++                        <DropdownMenu.Item key={collection.id} onSelect={() => void addManyToCollection(pickedRows, collection)}><Folder />{collection.name}</DropdownMenu.Item>
++                      ))}
++                    </DropdownMenu.Content>
++                  </DropdownMenu.Portal>
++                </DropdownMenu.Root>
++              )}
++              <Button size="sm" variant="outline" className="text-destructive" onClick={() => void trashMany(pickedRows)}><Trash2 />{t("Move to Trash")}</Button>
++              <Button size="sm" variant="ghost" className="ml-auto" onClick={() => { setPicked(new Set()); setSelectMode(false); }}><X />{t("Clear selection")}</Button>
++            </div>
++          ) : retention === "active" && (
+             <BatchTranscribe recordings={recordings} onFinished={() => void load()} />
+           )}
++          {bulkNotice && <p className="px-1 text-xs text-muted-foreground" role="status">{bulkNotice}</p>}
+           <div className="studio-library-toolbar">
+             <div
+               className="studio-source-tabs"
+@@ -358,6 +456,17 @@ export function Dashboard() {
+               ))}
+             </div>
+             <div className="studio-sort-tools">
++              {retention === "active" && (
++                <button
++                  className="studio-control"
++                  aria-pressed={selectMode}
++                  onClick={() => { setSelectMode((value) => !value); if (selectMode) setPicked(new Set()); }}
++                  title={t("Select several recordings (or Ctrl-click, Shift-click)")}
++                >
++                  <ListChecks />
++                  <span>{selectMode ? t("Done") : t("Select")}</span>
++                </button>
++              )}
+               <button
+                 className="studio-control"
+                 onClick={() => setFiltersOpen(true)}
+@@ -435,23 +544,26 @@ export function Dashboard() {
+           ) : (
+             <div
+               className={`studio-recordings ${view === "grid" ? "studio-grid" : ""}`}
++              onKeyDown={onListKey}
+             >
+               {filtered.map((row) => (
+                 <ContextMenu.Root key={row.id}>
+                 <ContextMenu.Trigger asChild disabled={retention === "trash"}>
+                 <article
+                   data-recording-id={row.id}
+-                  className={`studio-recording ${activeId === row.id && retention === "active" ? "selected" : ""}`}
++                  className={`studio-recording ${activeId === row.id && retention === "active" && !picked.size ? "selected" : ""} ${picked.has(row.id) ? "bg-primary/10" : ""}`}
+                 >
+                   <button
+                     id={`recording-open-${row.id}`}
+                     className="studio-row-main"
+-                    onClick={() => choose(row.id)}
+-                    aria-label={t("Open {title}", { title: row.title })}
++                    onClick={(event) => clickRow(event, row)}
++                    aria-label={t("Open {title}", { title: row.displayTitle })}
+                     aria-pressed={activeId === row.id}
+                   >
+-                    <span className="studio-source-icon">
+-                      {row.sourceProvider === "plaud" ? (
++                    <span className={`studio-source-icon ${picked.has(row.id) ? "bg-primary text-primary-foreground" : selectMode ? "border border-input" : ""}`}>
++                      {picked.has(row.id) ? (
++                        <><Check /><span className="sr-only">{t("Selected")}</span></>
++                      ) : selectMode ? null : row.sourceProvider === "plaud" ? (
+                         <FileAudio />
+                       ) : ["opennotes", "mobile", "microphone"].includes(
+                           row.sourceProvider || "",
+@@ -461,17 +573,17 @@ export function Dashboard() {
+                         <Play />
+                       )}
+                     </span>
+-                    <strong>{row.title}</strong>
++                    <strong>{row.displayTitle}</strong>
+                   </button>
+                   <div className="studio-row-tags">
+-                    {retention === "active" && (
++                    {/* A status (Not transcribed, Queued, Transcribing 42%, Failed) takes the tag column's place. */}
++                    {retention === "active" && recordingState(row, jobs) !== "complete" ? (
+                       <RecordingStateChip
+                         state={recordingState(row, jobs)}
+                         job={activeJobFor(jobs, row.id) ?? failedJobFor(jobs, row.id)}
+                         onRetry={() => setTranscribing(row)}
+                       />
+-                    )}
+-                    {(row.tags.filter((tag) => tag !== "Starred").length
++                    ) : (row.tags.filter((tag) => tag !== "Starred").length
+                       ? row.tags.filter((tag) => tag !== "Starred")
+                       : [
+                           row.sourceProvider === "plaud"
+@@ -484,8 +596,8 @@ export function Dashboard() {
+                         <span key={tag}>{tag}</span>
+                       ))}
+                   </div>
+-                  <time dateTime={row.recordedAt}>
+-                    {formatDate(row.recordedAt, {
++                  <time dateTime={row.startedAt}>
++                    {formatDate(row.startedAt, {
+                       month: "short",
+                       day: "numeric",
+                       year: "numeric",
+@@ -501,14 +613,14 @@ export function Dashboard() {
+                       <>
+                         <button
+                           title={t("Restore recording")}
+-                          aria-label={t("Restore {title}", { title: row.title })}
++                          aria-label={t("Restore {title}", { title: row.displayTitle })}
+                           onClick={() => void restore(row.id)}
+                         >
+                           <RotateCcw />
+                         </button>
+                         <button
+                           title={t("Permanently delete")}
+-                          aria-label={t("Permanently delete {title}", { title: row.title })}
++                          aria-label={t("Permanently delete {title}", { title: row.displayTitle })}
+                           onClick={() => void purge(row.id)}
+                         >
+                           <Trash2 />
+@@ -517,7 +629,7 @@ export function Dashboard() {
+                     ) : (
+                       <DropdownMenu.Root>
+                         <DropdownMenu.Trigger
+-                          aria-label={t("Actions for {title}", { title: row.title })}
++                          aria-label={t("Actions for {title}", { title: row.displayTitle })}
+                           title={t("Recording actions")}
+                         >
+                           <MoreHorizontal />
+@@ -527,6 +639,16 @@ export function Dashboard() {
+                             <DropdownMenu.Item onSelect={() => choose(row.id)}>
+                               <Play />{t("Open preview")}
+                             </DropdownMenu.Item>
++                            <DropdownMenu.Item disabled={Boolean(activeJobFor(jobs, row.id))} onSelect={() => setTranscribing(row)}>
++                              <AudioLines />{row.hasTranscript ? t("Transcribe again") : t("Transcribe")}
++                            </DropdownMenu.Item>
++                            <DropdownMenu.Item disabled={!row.hasTranscript} title={row.hasTranscript ? undefined : t("Transcribe this recording first")} onSelect={() => void summarizeOne(row)}>
++                              <AlignLeft />{t("Summarize")}
++                            </DropdownMenu.Item>
++                            <DropdownMenu.Item disabled={!row.hasTranscript} title={row.hasTranscript ? undefined : t("Transcribe this recording first")} onSelect={() => setDocumentFor(row)}>
++                              <FilePlus2 />{t("Create document")}
++                            </DropdownMenu.Item>
++                            <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                             <DropdownMenu.Item onSelect={() => editTags(row)}>
+                               <Tags />{t("Edit tags")}
+                             </DropdownMenu.Item>
+@@ -561,6 +683,11 @@ export function Dashboard() {
+                 <ContextMenu.Portal>
+                   <ContextMenu.Content className="action-menu" onCloseAutoFocus={event => { if (tagEditorOpen.current) event.preventDefault(); }}>
+                     <ContextMenu.Item onSelect={() => choose(row.id)}><Play />{t("Open preview")}</ContextMenu.Item>
++                    <ContextMenu.Item disabled={Boolean(activeJobFor(jobs, row.id))} onSelect={() => setTranscribing(row)}><AudioLines />{row.hasTranscript ? t("Transcribe again") : t("Transcribe")}</ContextMenu.Item>
++                    <ContextMenu.Item disabled={!row.hasTranscript} onSelect={() => void summarizeOne(row)}><AlignLeft />{t("Summarize")}</ContextMenu.Item>
++                    <ContextMenu.Item disabled={!row.hasTranscript} onSelect={() => setDocumentFor(row)}><FilePlus2 />{t("Create document")}</ContextMenu.Item>
++                    {picked.size > 1 && picked.has(row.id) && <ContextMenu.Item className="danger" onSelect={() => void trashMany(pickedRows)}><Trash2 />{tn(picked.size, "Move {count} selected to Trash", "Move {count} selected to Trash")}</ContextMenu.Item>}
++                    <ContextMenu.Separator className="my-1 h-px bg-border" />
+                     <ContextMenu.Item onSelect={() => editTags(row)}><Tags />{t("Edit tags")}</ContextMenu.Item>
+                     <CollectionContextSubmenu {...collectionMenu(row)} />
+                     <ContextMenu.Item onSelect={() => navigate(`/recording/${row.id}`)}><Pencil />{t("Edit recording")}</ContextMenu.Item>
+@@ -601,10 +728,18 @@ export function Dashboard() {
+             )
+           ))}
+       </div>
++      {documentFor && (
++        <SaveTranscriptForm
++          recordingId={documentFor.id}
++          versionId={documentFor.transcriptVersionId ?? null}
++          title={documentFor.displayTitle}
++          onClose={() => setDocumentFor(null)}
++        />
++      )}
+       {transcribing && (
+         <TranscribeDialog
+           recordingId={transcribing.id}
+-          title={transcribing.title}
++          title={transcribing.displayTitle}
+           onClose={() => setTranscribing(null)}
+           onQueued={() => { refreshActivity(); void load(); }}
+         />
+@@ -662,7 +797,7 @@ export function Dashboard() {
+                 value={status}
+                 onChange={(e) => setStatus(e.target.value)}
+               >
+-                {([["all", t("All")], ["complete", t("Complete")], ["pending", t("Pending")], ["transcribing", t("Transcribing")], ["failed", t("Failed")]] as const).map(
++                {([["all", t("All")], ["complete", t("Complete")], ["pending", t("Not transcribed")], ["transcribing", t("Transcribing")], ["failed", t("Failed")]] as const).map(
+                   ([value, label]) => (
+                     <option key={value} value={value}>
+                       {label}
+diff --git a/web/src/pages/RecordingDetail.tsx b/web/src/pages/RecordingDetail.tsx
+index b46a378..c701d18 100644
+--- a/web/src/pages/RecordingDetail.tsx
++++ b/web/src/pages/RecordingDetail.tsx
+@@ -46,7 +46,7 @@ import { formatDuration } from '@/lib/utils'
+ import { formatDate, t } from '@/i18n'
+ import { exportDocument, exportOriginalAudio, recordingMarkdown, safeDocumentName as safeName } from '@/lib/document-export'
+ import { deviceCommand, supportsPlaudDevice, vaultArguments } from '@/lib/plaud-device'
+-import { activeJobFor, DATA_CHANGED, recordingState, recordingStateLabel, useActivity, type ActivityJob } from '@/lib/activity'
++import { activeJobFor, DATA_CHANGED, notifyDataChanged, recordingState, recordingStateLabel, useActivity, type ActivityJob } from '@/lib/activity'
+ import { JobProgressPanel } from '@/components/JobProgress'
+ 
+ type BusyAction = 'transcribing' | 'summarizing' | 'saving' | 'forwarding' | null
+@@ -300,6 +300,7 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+   const trashRecording = async () => {
+     if (!recording || !window.confirm(t('Move this recording to Trash for 30 days?'))) return
+     await api.trashRecording(recording.id)
++    notifyDataChanged()
+     navigate('/')
+   }
+ 
+@@ -360,17 +361,17 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+ 
+   return (
+     <div className="recording-page">
+-      {transcribeOpen && <TranscribeDialog recordingId={recording.id} title={recording.title} onClose={() => setTranscribeOpen(false)} onQueued={() => { setRecording(current => current ? { ...current, status: 'pending' } : current) }} />}
++      {transcribeOpen && <TranscribeDialog recordingId={recording.id} title={recording.displayTitle} onClose={() => setTranscribeOpen(false)} onQueued={() => { setRecording(current => current ? { ...current, status: 'pending' } : current) }} />}
+       <header className="recording-toolbar">
+         <Link to={backPath} className="recording-back" aria-label={backPath === '/transcripts' ? t('Back to transcripts') : t('Back to library')}><ArrowLeft /></Link>
+         <div className="recording-title-block">
+           {editingMetadata ? (
+             <input value={titleDraft} onChange={event => setTitleDraft(event.target.value)} className="recording-title-input" aria-label={t('Recording title')} />
+-          ) : <h1>{recording.title}</h1>}
++          ) : <h1>{recording.displayTitle}</h1>}
+           <p>{formatRecordingDate(recording.recordedAt)} <span /> {sourceLabel}</p>
+         </div>
+         <div className="recording-toolbar-actions">
+-          <SaveTranscriptDialog recordingId={recording.id} versionId={selectedVersion?.id ?? recording.transcriptVersionId ?? null} title={recording.title} disabled={recording.transcriptText === undefined || action !== null || documentMode === 'edit'} />
++          <SaveTranscriptDialog recordingId={recording.id} versionId={selectedVersion?.id ?? recording.transcriptVersionId ?? null} title={recording.displayTitle} disabled={recording.transcriptText === undefined || action !== null || documentMode === 'edit'} />
+           {saved && <span className="saved-state"><Check />{t('Saved')}</span>}
+           <DropdownMenu.Root>
+             <DropdownMenu.Trigger asChild>
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index ed2b5bc..07dd275 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -129,6 +129,11 @@ export function SettingsPage() {
+         </select>
+       </div>
+ 
++      <div className="flex items-center justify-between gap-4 border-b pb-4">
++        <span className="text-sm font-medium">{t('API & MCP')}</span>
++        <Button asChild variant="outline" size="sm"><Link to="/developer">{t('Open API & MCP')}</Link></Button>
++      </div>
++
+       <details className="border-b pb-4">
+         <summary className="cursor-pointer text-sm text-muted-foreground">{t('About OpenPlod')}</summary>
+         <dl className="grid gap-3 py-4 text-sm"><div><dt className="text-muted-foreground">{t('Version')}</dt><dd>{buildInfo.version}</dd></div><div><dt className="text-muted-foreground">{t('Installed build')}</dt><dd><time dateTime={buildInfo.builtAt}>{buildLabel}</time></dd></div><div><dt className="text-muted-foreground">{t('Platform')}</dt><dd>{runtime.mode === 'desktop' ? t('Desktop') : runtime.mode === 'mobile' ? t('Mobile') : t('Browser')}</dd></div></dl>
+diff --git a/web/src/pages/TranscriptsPage.tsx b/web/src/pages/TranscriptsPage.tsx
+index 35ce780..fc0f7f8 100644
+--- a/web/src/pages/TranscriptsPage.tsx
++++ b/web/src/pages/TranscriptsPage.tsx
+@@ -8,12 +8,26 @@ import { Button } from '@/components/ui/button'
+ import { IconButton } from '@/components/ui/icon-button'
+ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+ import { SaveTranscriptDialog } from '@/components/NoteDialogs'
+-import { api, type Recording, type TranscriptDocument } from '@/lib/api'
++import { api, displayRecordingName, type Recording, type TranscriptDocument, type TranscriptSegment } from '@/lib/api'
+ import { formatDuration, formatRelativeDate } from '@/lib/utils'
+ import { exportDocument, recordingMarkdown, safeDocumentName } from '@/lib/document-export'
+ import { t, tn } from '@/i18n'
+ import './transcripts.css'
+ 
++/** True when the transcript's segments carry speaker labels (the preview then shows speaker turns). */
++const hasSpeakers = (segments?: TranscriptSegment[]) => Boolean(segments?.length && segments.some(segment => segment.speakerId !== null))
++
++/** The transcript as speaker turns: consecutive segments from one speaker joined, with the start time. */
++function SpeakerTurns({ segments }: { segments: TranscriptSegment[] }) {
++  const turns: { speaker: string; start: number; text: string }[] = []
++  for (const segment of segments) {
++    const last = turns[turns.length - 1], text = segment.text.trim()
++    if (last && last.speaker === segment.speaker) last.text += ` ${text}`
++    else turns.push({ speaker: segment.speaker, start: segment.startTime, text })
++  }
++  return <>{turns.map((turn, index) => <p key={index}><strong>{turn.speaker}</strong> <span className="text-xs text-muted-foreground">{formatDuration(turn.start)}</span><br />{turn.text}</p>)}</>
++}
++
+ const sourceName = (source: string | null) => source === 'plaud' ? 'Plaud' : source === 'opennotes' ? t('Phone') : t('Imported')
+ export function TranscriptsPage() {
+   const [params, setParams] = useSearchParams()
+@@ -81,16 +95,16 @@ export function TranscriptsPage() {
+       <aside className="transcripts-library" aria-label={t('Transcript library')}>
+         <div className="transcripts-toolbar"><FileText /><select aria-label={t('Transcript source')} value={source} onChange={event => { setSource(event.target.value); setParams({}) }}><option value="">{t('All transcripts')}</option><option value="plaud">Plaud Note Pro</option><option value="opennotes">{t('Phone')}</option><option value="upload">{t('Imported audio')}</option></select></div>
+         {error && <div className="transcripts-error" role="alert"><p>{error}</p><Button size="sm" variant="ghost" onClick={() => setRefreshKey(v => v + 1)}><RefreshCw />{t('Retry')}</Button></div>}
+-        <div className="transcript-documents">{documents.map(document => <button type="button" key={document.recordingId} aria-pressed={chosen === document.recordingId} className="transcript-document" onClick={() => setParams({ recording: document.recordingId })}><FileText /><span className="transcript-document-copy"><strong>{document.filename?.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ') || t('Untitled transcript')}</strong><span className="transcript-excerpt">{document.excerpt || t('Empty transcript')}</span><span className="transcript-document-meta"><span>{formatRelativeDate(document.recordedAt)}</span><span>{sourceName(document.sourceProvider)}</span></span></span></button>)}</div>
++        <div className="transcript-documents">{documents.map(document => <button type="button" key={document.recordingId} aria-pressed={chosen === document.recordingId} className="transcript-document" onClick={() => setParams({ recording: document.recordingId })}><FileText /><span className="transcript-document-copy"><strong>{document.filename ? displayRecordingName(document.filename) : t('Untitled transcript')}</strong><span className="transcript-excerpt">{document.excerpt || t('Empty transcript')}</span><span className="transcript-document-meta"><span>{formatRelativeDate(document.recordedAt)}</span><span>{sourceName(document.sourceProvider)}</span></span></span></button>)}</div>
+         {loading && <div className="transcripts-loading" role="status" aria-label={t('Loading transcripts')}><Loader2 className="animate-spin" /></div>}
+         {!loading && !error && !documents.length && <div className="transcripts-empty"><FileText /><h2>{t('No transcripts yet')}</h2><Button asChild variant="outline" size="sm"><Link to="/recordings"><AudioLines />{t('Recordings')}</Link></Button></div>}
+         {hasMore && <Button className="transcripts-more" variant="ghost" disabled={loading} onClick={() => void loadMore()}><ChevronDown />{t('Load more')}</Button>}
+       </aside>
+       <section className="transcript-reader" aria-label={t('Transcript reader')} aria-busy={reading}>
+-        <header className="transcript-reader-heading"><IconButton className="transcript-back" label={t('Back to transcripts')} onClick={() => setParams({})}><ArrowLeft /></IconButton><div><h2>{recording?.title || (reading ? t('Loading transcript') : t('Transcript'))}</h2>{recording && <p>{formatRelativeDate(recording.recordedAt)}<span>{recording.transcriptOrigin === 'edited' ? t('Edited transcript') : t('Generated transcript')}</span></p>}</div><div className="transcript-reader-actions">{recording && <><IconButton asChild label={t('Edit transcript')}><Link to={`/transcripts/${recording.id}`}><Pencil /></Link></IconButton><IconButton asChild label={t('Ask AI about transcript')}><Link to={`/ai?recording=${recording.id}`}><MessageSquare /></Link></IconButton><DropdownMenu.Root><DropdownMenu.Trigger asChild><Button size="sm" variant="outline"><Download />{t('Export')}<ChevronDown /></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="action-menu" align="end">{(['md', 'txt', 'json', 'pdf'] as const).map(format => <DropdownMenu.Item key={format} onSelect={() => void download(format)}><Download />{format === 'md' ? t('Markdown file') : format === 'txt' ? t('Plain text') : format === 'json' ? t('JSON file') : t('PDF document')}</DropdownMenu.Item>)}</DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root></>}</div></header>
+-        {recording && <div className="transcript-reader-toolbar"><ToggleGroup type="single" value={mode} onValueChange={v => { if (v) setMode(v) }} aria-label={t('Transcript view')}><ToggleGroupItem value="preview">{t('Preview')}</ToggleGroupItem><ToggleGroupItem value="markdown">Markdown</ToggleGroupItem></ToggleGroup><SaveTranscriptDialog recordingId={recording.id} versionId={recording.transcriptVersionId ?? null} title={recording.title} disabled={!recording.transcriptText} /></div>}
++        <header className="transcript-reader-heading"><IconButton className="transcript-back" label={t('Back to transcripts')} onClick={() => setParams({})}><ArrowLeft /></IconButton><div><h2>{recording?.displayTitle || (reading ? t('Loading transcript') : t('Transcript'))}</h2>{recording && <p>{formatRelativeDate(recording.startedAt)}<span>{recording.transcriptOrigin === 'edited' ? t('Edited transcript') : t('Generated transcript')}</span></p>}</div><div className="transcript-reader-actions">{recording && <><IconButton asChild label={t('Edit transcript')}><Link to={`/transcripts/${recording.id}`}><Pencil /></Link></IconButton><IconButton asChild label={t('Ask AI about transcript')}><Link to={`/ai?recording=${recording.id}`}><MessageSquare /></Link></IconButton><DropdownMenu.Root><DropdownMenu.Trigger asChild><Button size="sm" variant="outline"><Download />{t('Export')}<ChevronDown /></Button></DropdownMenu.Trigger><DropdownMenu.Portal><DropdownMenu.Content className="action-menu" align="end">{(['md', 'txt', 'json', 'pdf'] as const).map(format => <DropdownMenu.Item key={format} onSelect={() => void download(format)}><Download />{format === 'md' ? t('Markdown file') : format === 'txt' ? t('Plain text') : format === 'json' ? t('JSON file') : t('PDF document')}</DropdownMenu.Item>)}</DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root></>}</div></header>
++        {recording && <div className="transcript-reader-toolbar"><ToggleGroup type="single" value={mode} onValueChange={v => { if (v) setMode(v) }} aria-label={t('Transcript view')}><ToggleGroupItem value="preview">{t('Preview')}</ToggleGroupItem><ToggleGroupItem value="markdown">Markdown</ToggleGroupItem></ToggleGroup><SaveTranscriptDialog recordingId={recording.id} versionId={recording.transcriptVersionId ?? null} title={recording.displayTitle} disabled={!recording.transcriptText} /></div>}
+         {readerError && <div className="transcripts-error" role="alert"><p>{readerError}</p><Button size="sm" variant="ghost" onClick={() => setRefreshKey(v => v + 1)}><RefreshCw />{t('Retry')}</Button></div>}
+-        <div className="transcript-reader-body">{reading ? <div className="transcripts-loading" role="status"><Loader2 className="animate-spin" /></div> : recording ? mode === 'preview' ? <div className="markdown-document transcript-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ img: () => null, a: ({ children }) => <span>{children}</span> }}>{recording.transcriptText || t('No transcript text.')}</ReactMarkdown></div> : <pre className="transcript-raw" aria-label={t('Transcript Markdown')}>{recording.transcriptText || ''}</pre> : !readerError && <div className="transcripts-empty"><FileText /><h2>{t('Select a transcript')}</h2></div>}</div>
++        <div className="transcript-reader-body">{reading ? <div className="transcripts-loading" role="status"><Loader2 className="animate-spin" /></div> : recording ? mode === 'preview' && hasSpeakers(recording.segments) ? <div className="markdown-document transcript-markdown"><SpeakerTurns segments={recording.segments ?? []} /></div> : mode === 'preview' ? <div className="markdown-document transcript-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={{ img: () => null, a: ({ children }) => <span>{children}</span> }}>{recording.transcriptText || t('No transcript text.')}</ReactMarkdown></div> : <pre className="transcript-raw" aria-label={t('Transcript Markdown')}>{recording.transcriptText || ''}</pre> : !readerError && <div className="transcripts-empty"><FileText /><h2>{t('Select a transcript')}</h2></div>}</div>
+         {recording && <footer className="transcript-reader-footer"><span>{tn(recording.transcriptText?.trim().split(/\s+/).filter(Boolean).length || 0, '{count} word', '{count} words')}</span><span>{formatDuration(recording.duration)}</span><Link to={`/recording/${recording.id}`}><AudioLines />{t('Open recording')}</Link></footer>}
+       </section>
+     </div>

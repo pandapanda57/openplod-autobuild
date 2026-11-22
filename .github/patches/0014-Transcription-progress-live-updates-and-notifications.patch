@@ -1,0 +1,1013 @@
+Subject: [PATCH] Transcription progress, live updates and notifications
+
+One shared poller follows queued and running jobs (GET /api/jobs?active=1, every 2.5 s while a job
+runs, 15 s otherwise). The recording page and the preview show a progress panel (step, bar, percent,
+time elapsed, time remaining, Cancel); list rows show Not transcribed, Queued, Transcribing 42% or
+Failed with Retry. When a job ends, lists, counts, collections and open pages reload on their own and
+the bell gets a count and a list (transcript ready, failed, imported). On the desktop app the taskbar
+button shows progress, the tray tooltip shows the recording, percent and time left, and a Windows
+notification (official Tauri notification plugin) says when a transcription ends while OpenPlod is in
+the background. The Processing jobs list in Settings follows along without Refresh. Adds French text
+for these strings and for the local pipeline settings from patch 12.
+---
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index 7093698..b805d1b 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -32,3 +32,5 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking"]
+ tempfile = "3"
+ # REL-07: signed in-app updates. The public key is injected at release build time (see scripts/release-config.ts).
+ tauri-plugin-updater = "2"
++# Windows notification when a transcription finishes while OpenPlod is in the background.
++tauri-plugin-notification = "2"
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index 4c533d0..547cec7 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -7,6 +7,10 @@
+   ],
+   "permissions": [
+     "core:default",
+-    "updater:default"
++    "updater:default",
++    "core:window:allow-set-progress-bar",
++    "core:tray:default",
++    "core:tray:allow-set-tooltip",
++    "notification:default"
+   ]
+ }
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 448428c..c81dfe8 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -223,6 +223,8 @@ pub fn run() {
+   #[cfg(desktop)]
+   let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+   #[cfg(desktop)]
++  let builder = builder.plugin(tauri_plugin_notification::init());
++  #[cfg(desktop)]
+   let builder = builder.on_window_event(tray::on_window_event);
+ 
+   #[cfg(desktop)]
+diff --git a/src/index.ts b/src/index.ts
+index 81603fa..d1d6194 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -297,7 +297,20 @@ app.patch('/api/settings', async (c) => {
+ });
+ 
+ // Jobs
+-app.get('/api/jobs', (c) => c.json({ success: true, data: jobQueue.getJobs().map(({ data, ...job }) => ({ ...job, checkpoint: job.checkpoint && { phase: job.checkpoint.phase, remoteId: job.checkpoint.remoteId, inFlight: job.checkpoint.inFlight, progress: job.checkpoint.progress }, recordingId: (data as any).recordingId, provider: (data as any).config?.transcriptionEngine })), stats: jobQueue.getStats() }));
++// `?active=1` (polled by the app for progress) returns only queued and running jobs plus those that
++// ended in the last 15 minutes, each with its recording's file name and Plaud session for display.
++const ACTIVE_JOB_WINDOW_MS = 15 * 60000;
++const recordingNames = sqlite.query('SELECT original_filename AS filename, source_recording_id AS sourceRecordingId FROM recordings WHERE id = ?');
++app.get('/api/jobs', (c) => {
++  const active = c.req.query('active') === '1', since = Date.now() - ACTIVE_JOB_WINDOW_MS;
++  const jobs = jobQueue.getJobs().filter(job => !active || job.status === 'pending' || job.status === 'running' || (job.completedAt ? new Date(job.completedAt).getTime() >= since : false));
++  return c.json({ success: true, data: jobs.map(({ data, ...job }) => {
++    const recordingId = (data as any).recordingId;
++    const names = active && typeof recordingId === 'string' ? recordingNames.get(recordingId) as { filename: string | null; sourceRecordingId: string | null } | null : null;
++    return { ...job, checkpoint: job.checkpoint && { phase: job.checkpoint.phase, remoteId: job.checkpoint.remoteId, inFlight: job.checkpoint.inFlight, progress: job.checkpoint.progress }, recordingId, provider: (data as any).config?.transcriptionEngine,
++      ...(names ? { recordingFilename: names.filename, sourceRecordingId: names.sourceRecordingId } : {}) };
++  }), stats: jobQueue.getStats() });
++});
+ app.post('/api/jobs/:id/cancel', c => c.json({ success: jobQueue.cancel(c.req.param('id')) }));
+ app.post('/api/jobs/:id/resume', c => c.json({ success: jobQueue.resume(c.req.param('id')) }));
+ app.patch('/api/jobs/:id', async c => { const body = await c.req.json(); return c.json({ success: jobQueue.setPriority(c.req.param('id'), body.priority) }); });
+diff --git a/web/package.json b/web/package.json
+index af82ce5..35d1f5f 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -24,6 +24,7 @@
+     "@radix-ui/react-tooltip": "^1.4.1",
+     "@tailwindcss/vite": "^4.3.5",
+     "@tauri-apps/api": "^2.12.4",
++    "@tauri-apps/plugin-notification": "2",
+     "@tauri-apps/plugin-updater": "2",
+     "@zxing/browser": "^0.2.1",
+     "class-variance-authority": "^0.7.1",
+diff --git a/web/src/components/AiSettingsPanel.tsx b/web/src/components/AiSettingsPanel.tsx
+index 4458519..ad3e2e8 100644
+--- a/web/src/components/AiSettingsPanel.tsx
++++ b/web/src/components/AiSettingsPanel.tsx
+@@ -3,6 +3,7 @@ import { aiSettingsApi, profilesApi, type AiSettings, type AiConfig, type Speech
+ import { PROMPT_LIMIT, configOf, customEndpointIsLocal, formatUsd, jobStatusLabel, languageLabel, languagesFor } from '@/lib/transcription'
+ import { t, tn } from '@/i18n'
+ import { PROFILES_CHANGED } from '@/components/TranscriptionProfilesPanel'
++import { useActivity } from '@/lib/activity'
+ import { Input } from '@/components/ui/input'
+ import { Button } from '@/components/ui/button'
+ import { Save, RefreshCw, X, Loader2 } from '@/components/icons'
+@@ -20,6 +21,9 @@ export function AiSettingsPanel() {
+   const [vocabulary, setVocabulary] = useState('')
+   const [error, setError] = useState(''), [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
+   const [models, setModels] = useState<string[]>([]), [jobs, setJobs] = useState<ProcessingJob[]>([])
++  // While the job list is open it follows the shared activity poller instead of waiting for Refresh.
++  const { jobs: liveJobs } = useActivity(), [jobsOpen, setJobsOpen] = useState(false)
++  useEffect(() => { if (jobsOpen) aiSettingsApi.jobs().then(setJobs).catch(() => {}) }, [jobsOpen, liveJobs])
+   const [contexts, setContexts] = useState<Record<string, number | null>>({}), [spend, setSpend] = useState<MonthSpend | null>(null)
+   useEffect(() => { let active = true; aiSettingsApi.get().then(value => { if (active) { setSettings(value); setVocabulary(value.transcriptionVocabulary.join(', ')) } }).catch(e => { if (active) setError(e.message) }); aiSettingsApi.spending().then(value => { if (active) setSpend(value) }).catch(() => {}); return () => { active = false } }, [])
+   const [profiles, setProfiles] = useState<TranscriptionProfile[]>([])
+@@ -94,6 +98,6 @@ export function AiSettingsPanel() {
+       <p className="text-xs text-muted-foreground sm:col-span-2">{spend ? `${t('Estimated this month ({month}, UTC): {amount}', { month: spend.month, amount: formatUsd(spend.estimatedUsd) })}${spend.unknownEntries ? tn(spend.unknownEntries, ', plus {count} job with unknown cost', ', plus {count} jobs with unknown cost') : ''}${spend.budgetUsd !== null ? t('; {remaining} of {budget} left', { remaining: formatUsd(spend.remainingUsd), budget: formatUsd(spend.budgetUsd) }) : ''}. ` : ''}{settings.pricing.label} {t('Prices as of {date}. Jobs over the budget or threshold need your confirmation; providers do not enforce this limit.', { date: settings.pricing.pricesAsOf })}</p>
+     </fieldset>
+     {used.length > 0 && <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Credentials')}</legend>{used.map(provider => <div key={provider} className="flex items-end gap-2"><label className="grid flex-1 gap-2 text-sm">{provider === 'custom' ? t('{provider} API key (optional)', { provider: providerName(provider) }) : t('{provider} API key', { provider: labels[provider] })}<Input type="password" autoComplete="off" value={keys[`${provider}ApiKey`] || ''} placeholder={settings.credentials[`${provider}ApiKey`] ? t('Saved key') : t('Not configured')} onChange={e => setKeys(value => ({ ...value, [`${provider}ApiKey`]: e.target.value }))} /></label><Button variant="outline" disabled={Object.keys(keys).length > 0} onClick={() => action(async () => { await aiSettingsApi.check(provider); setNotice(t('{provider} connection verified', { provider: providerName(provider) })) })}>{t('Check')}</Button></div>)}</fieldset>}
+-    <details className="border-t pt-4"><summary className="cursor-pointer text-sm">{t('Processing jobs')}</summary><Button variant="ghost" className="my-2" onClick={() => action(async () => setJobs(await aiSettingsApi.jobs()))}><RefreshCw />{t('Refresh')}</Button><ul className="divide-y">{jobs.slice().reverse().map(job => <li key={job.id} className="flex items-center gap-2 py-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate">{(job.provider ? providerName(job.provider) : '') || t('Processing')} / {jobStatusLabel(job.status)}{job.checkpoint?.progress && job.checkpoint.phase.startsWith('pipeline') ? ` / ${job.checkpoint.progress.done}%` : job.checkpoint?.progress ? ` / ${t('chunk {done} of {total}', { done: Math.min(job.checkpoint.progress.done + (job.status === 'running' ? 1 : 0), job.checkpoint.progress.total), total: job.checkpoint.progress.total })}` : ''}</p><p className="break-words text-xs text-muted-foreground">{job.error || job.checkpoint?.phase || job.recordingId}</p></div>{['running', 'pending'].includes(job.status) && <Button variant="ghost" size="icon" title={t('Cancel processing')} onClick={() => action(async () => { await aiSettingsApi.cancel(job.id); setJobs(await aiSettingsApi.jobs()) })}><X /></Button>}{(job.checkpoint?.remoteId || job.checkpoint?.inFlight === false) && ['failed', 'cancelled'].includes(job.status) && <Button variant="outline" onClick={() => action(async () => { await aiSettingsApi.resume(job.id); setJobs(await aiSettingsApi.jobs()) })}>{t('Resume')}</Button>}</li>)}</ul></details>
++    <details className="border-t pt-4" onToggle={event => setJobsOpen((event.currentTarget as HTMLDetailsElement).open)}><summary className="cursor-pointer text-sm">{t('Processing jobs')}</summary><Button variant="ghost" className="my-2" onClick={() => action(async () => setJobs(await aiSettingsApi.jobs()))}><RefreshCw />{t('Refresh')}</Button><ul className="divide-y">{jobs.slice().reverse().map(job => <li key={job.id} className="flex items-center gap-2 py-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate">{(job.provider ? providerName(job.provider) : '') || t('Processing')} / {jobStatusLabel(job.status)}{job.checkpoint?.progress && job.checkpoint.phase.startsWith('pipeline') ? ` / ${job.checkpoint.progress.done}%` : job.checkpoint?.progress ? ` / ${t('chunk {done} of {total}', { done: Math.min(job.checkpoint.progress.done + (job.status === 'running' ? 1 : 0), job.checkpoint.progress.total), total: job.checkpoint.progress.total })}` : ''}</p><p className="break-words text-xs text-muted-foreground">{job.error || job.checkpoint?.phase || job.recordingId}</p></div>{['running', 'pending'].includes(job.status) && <Button variant="ghost" size="icon" title={t('Cancel processing')} onClick={() => action(async () => { await aiSettingsApi.cancel(job.id); setJobs(await aiSettingsApi.jobs()) })}><X /></Button>}{(job.checkpoint?.remoteId || job.checkpoint?.inFlight === false) && ['failed', 'cancelled'].includes(job.status) && <Button variant="outline" onClick={() => action(async () => { await aiSettingsApi.resume(job.id); setJobs(await aiSettingsApi.jobs()) })}>{t('Resume')}</Button>}</li>)}</ul></details>
+   </section>
+ }
+diff --git a/web/src/components/BatchTranscribe.tsx b/web/src/components/BatchTranscribe.tsx
+index 019248a..3ccf9ed 100644
+--- a/web/src/components/BatchTranscribe.tsx
++++ b/web/src/components/BatchTranscribe.tsx
+@@ -5,6 +5,7 @@ import { api, type BatchEstimate, type BatchJob, type DocumentBatchEstimate, typ
+ import { describeEstimate } from '@/lib/transcription'
+ import { documentStyleLabel, DOCUMENT_STYLES, notesApi, type DocumentStyle, type NoteFolder } from '@/lib/notes-api'
+ import { t, tn } from '@/i18n'
++import { refreshActivity } from '@/lib/activity'
+ import './batch-transcribe.css'
+ 
+ /**
+@@ -81,6 +82,7 @@ export function BatchTranscribe({ recordings, onFinished }: {
+     try {
+       const ids = retryOf ? [] : candidates.map(row => row.id)
+       setJob(await api.startBatch(ids, { ...(retryOf ? { retryOf } : {}), ...(costAccepted ? { confirmCost: true } : {}) }))
++      refreshActivity()
+       setEstimate(null)
+     } catch (failure) { fail(failure) }
+     finally { if (mounted.current) setBusy(false) }
+diff --git a/web/src/components/JobProgress.tsx b/web/src/components/JobProgress.tsx
+new file mode 100644
+index 0000000..b7faee0
+--- /dev/null
++++ b/web/src/components/JobProgress.tsx
+@@ -0,0 +1,68 @@
++import { useState } from 'react'
++import { AlertCircle, Loader2, X } from '@/components/icons'
++import { Button } from '@/components/ui/button'
++import { aiSettingsApi } from '@/lib/ai-settings'
++import { formatSpan, jobProgress, recordingStateLabel, refreshActivity, useActivity, type ActivityJob, type RecordingState } from '@/lib/activity'
++import { t } from '@/i18n'
++
++const clock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`
++
++function ProgressBar({ percent }: { percent: number | null }) {
++  return (
++    <div className="h-2 w-full overflow-hidden rounded-full bg-muted" role="progressbar" aria-valuemin={0} aria-valuemax={100} {...(percent !== null ? { 'aria-valuenow': percent } : {})}>
++      {percent !== null
++        ? <div className="h-full rounded-full bg-primary transition-[width] duration-500" style={{ width: `${Math.max(2, percent)}%` }} />
++        : <div className="h-full w-full animate-pulse rounded-full bg-primary/60" />}
++    </div>
++  )
++}
++
++/** Progress for a queued or running transcription: step, bar, percent, elapsed, time left, Cancel. */
++export function JobProgressPanel({ job, compact = false }: { job: ActivityJob; compact?: boolean }) {
++  const { now } = useActivity()
++  const [cancelling, setCancelling] = useState(false)
++  const [error, setError] = useState('')
++  const p = jobProgress(job, now)
++  const cancel = async () => {
++    setCancelling(true); setError('')
++    try { await aiSettingsApi.cancel(job.id); refreshActivity() } catch (e) { setError(e instanceof Error ? e.message : String(e)) } finally { setCancelling(false) }
++  }
++  const details = [
++    p.percent !== null ? `${p.percent}%` : null,
++    p.elapsedSec !== null ? t('{time} elapsed', { time: clock(p.elapsedSec) }) : null,
++    p.remainingSec !== null ? t('about {span} left', { span: formatSpan(p.remainingSec) }) : null,
++  ].filter(Boolean).join(' · ')
++  return (
++    <div className={`grid gap-3 rounded-lg border bg-card p-4 text-left ${compact ? '' : 'w-full max-w-md'}`} role="status" aria-live="polite">
++      <div className="flex items-center gap-2">
++        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-primary" />
++        <strong className="text-sm">{p.queued ? t('Queued for transcription') : t('Transcribing')}</strong>
++        <Button size="sm" variant="ghost" className="ml-auto" disabled={cancelling} onClick={() => void cancel()}><X />{t('Cancel')}</Button>
++      </div>
++      {p.queued
++        ? <p className="text-xs text-muted-foreground">{t('Starts when the transcription before it finishes.')}</p>
++        : <>
++            <p className="text-sm">{p.step !== null && p.steps !== null ? t('Step {step} of {steps}: {name}', { step: p.step, steps: p.steps, name: p.stepLabel }) : p.stepLabel}</p>
++            <ProgressBar percent={p.percent} />
++            {details && <p className="text-xs text-muted-foreground">{details}</p>}
++          </>}
++      {error && <p className="flex items-center gap-1 text-xs text-destructive"><AlertCircle className="h-3 w-3" />{error}</p>}
++    </div>
++  )
++}
++
++/** Small status label for a recording row: Queued, Transcribing 42%, Failed, Not transcribed. */
++export function RecordingStateChip({ state, job, onRetry }: { state: RecordingState; job?: ActivityJob; onRetry?: () => void }) {
++  const { now } = useActivity()
++  if (state === 'complete') return null
++  const percent = job && state === 'transcribing' ? jobProgress(job, now).percent : null
++  const tone = state === 'failed' ? 'border-destructive/40 text-destructive' : state === 'not-transcribed' ? 'text-muted-foreground' : 'border-primary/40 text-primary'
++  return (
++    <span className={`inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] ${tone}`} title={job?.error || undefined}>
++      {(state === 'transcribing' || state === 'queued' || state === 'summarizing') && <Loader2 className="h-3 w-3 animate-spin" />}
++      {state === 'failed' && <AlertCircle className="h-3 w-3" />}
++      {recordingStateLabel(state)}{percent !== null ? ` ${percent}%` : ''}
++      {state === 'failed' && onRetry && <button type="button" className="ml-1 underline" onClick={event => { event.stopPropagation(); onRetry() }}>{t('Retry')}</button>}
++    </span>
++  )
++}
+diff --git a/web/src/components/Layout.tsx b/web/src/components/Layout.tsx
+index 967c511..8b16bd1 100644
+--- a/web/src/components/Layout.tsx
++++ b/web/src/components/Layout.tsx
+@@ -36,11 +36,12 @@ import {
+ } from "@/components/ui/tooltip";
+ import { api } from "@/lib/api";
+ import { getRuntime, apiUrl, authenticatedHeaders } from "@/lib/runtime";
++import { addNotice, clearNotices, DATA_CHANGED, markNoticesRead, startActivity, useActivity } from "@/lib/activity";
+ import { useTheme } from "@/hooks/useTheme";
+ import { buildInfo, buildLabel } from "@/lib/build-info";
+ import { knowledgeApi, type RecordingCollection } from "@/lib/knowledge";
+ import { COLLECTIONS_EVENT } from "./RecordingCollections";
+-import { t } from "@/i18n";
++import { formatDate, t } from "@/i18n";
+ 
+ // Functions, not constants, so the labels follow the current language.
+ const desktopNav = () => [
+@@ -76,8 +77,13 @@ export function Layout() {
+     const load = () => knowledgeApi.collections().then(rows => { if (!disposed) setCollections(rows); }).catch(() => {});
+     void load();
+     window.addEventListener(COLLECTIONS_EVENT, load);
+-    return () => { disposed = true; window.removeEventListener(COLLECTIONS_EVENT, load); };
++    window.addEventListener(DATA_CHANGED, load);
++    return () => { disposed = true; window.removeEventListener(COLLECTIONS_EVENT, load); window.removeEventListener(DATA_CHANGED, load); };
+   }, []);
++  // One shared poller for transcription progress; finished jobs fire DATA_CHANGED and add notifications.
++  useEffect(() => { startActivity(); }, []);
++  const { notices } = useActivity();
++  const unread = notices.filter((notice) => !notice.read).length;
+   useEffect(() => {
+     let disposed = false;
+     const load = () =>
+@@ -89,9 +95,11 @@ export function Layout() {
+         .catch(() => {});
+     void load();
+     window.addEventListener("plaud:sync-complete", load);
++    window.addEventListener(DATA_CHANGED, load);
+     return () => {
+       disposed = true;
+       window.removeEventListener("plaud:sync-complete", load);
++      window.removeEventListener(DATA_CHANGED, load);
+     };
+   }, []);
+ 
+@@ -135,6 +143,7 @@ export function Layout() {
+           newest = result.data?.events?.[0]?.id ?? 0;
+         if (!stopped && lastId !== null && newest > lastId) {
+           setSyncMessage(t("Plaud recording safely stored in your vault"));
++          addNotice({ kind: "imported", title: t("Plaud recording safely stored in your vault") });
+           window.dispatchEvent(new CustomEvent("plaud:sync-complete"));
+           if (clearMessageTimer.current)
+             clearTimeout(clearMessageTimer.current);
+@@ -300,29 +309,57 @@ export function Layout() {
+                     {dark ? t("Light mode") : t("Dark mode")}
+                   </TooltipContent>
+                 </Tooltip>
+-                <DropdownMenu.Root>
++                <DropdownMenu.Root onOpenChange={(open) => { if (!open) markNoticesRead(); }}>
+                   <DropdownMenu.Trigger asChild>
+                     <Button
+                       variant="ghost"
+                       size="icon"
+-                      aria-label={t("Notifications")}
++                      className="relative"
++                      aria-label={unread ? t("Notifications ({count} new)", { count: unread }) : t("Notifications")}
+                       title={t("Notifications")}
+                     >
+                       <Bell />
++                      {unread > 0 && (
++                        <span className="absolute -right-0.5 -top-0.5 min-w-4 rounded-full bg-primary px-1 text-[10px] font-semibold leading-4 text-primary-foreground">
++                          {unread > 9 ? "9+" : unread}
++                        </span>
++                      )}
+                     </Button>
+                   </DropdownMenu.Trigger>
+                   <DropdownMenu.Portal>
+                     <DropdownMenu.Content
+-                      className="action-menu notification-menu"
++                      className="action-menu notification-menu max-h-[70vh] w-80 overflow-y-auto"
+                       align="end"
+                     >
+                       <DropdownMenu.Label>{t("Notifications")}</DropdownMenu.Label>
+-                      <p>
+-                        {syncMessage || t("No new notifications this session.")}
+-                      </p>
++                      {notices.length === 0 ? (
++                        <p>{syncMessage || t("No notifications yet.")}</p>
++                      ) : (
++                        notices.map((notice) => (
++                          <DropdownMenu.Item
++                            key={notice.id}
++                            className="grid gap-0.5"
++                            onSelect={() => { if (notice.recordingId) navigate(`/recording/${notice.recordingId}`); else if (notice.kind === "imported") navigate("/"); }}
++                          >
++                            <span className={`text-sm ${notice.read ? "" : "font-semibold"} ${notice.kind === "failed" ? "text-destructive" : ""}`}>
++                              {notice.kind === "transcribed" ? t("Transcript ready") : notice.kind === "failed" ? t("Transcription failed") : t("Recording imported")}
++                            </span>
++                            <span className="truncate text-xs text-muted-foreground">
++                              {notice.kind === "imported" ? "" : notice.title}{notice.kind === "failed" && notice.detail ? `: ${notice.detail}` : ""}
++                            </span>
++                            <span className="text-[11px] text-muted-foreground">{formatDate(notice.at, { dateStyle: "medium", timeStyle: "short" })}</span>
++                          </DropdownMenu.Item>
++                        ))
++                      )}
++                      <DropdownMenu.Separator className="my-1 h-px bg-border" />
+                       <DropdownMenu.Item onSelect={() => navigate("/devices")}>
+                         {t("Device activity")}
+                       </DropdownMenu.Item>
++                      {notices.length > 0 && (
++                        <DropdownMenu.Item onSelect={() => clearNotices()}>
++                          {t("Clear notifications")}
++                        </DropdownMenu.Item>
++                      )}
+                     </DropdownMenu.Content>
+                   </DropdownMenu.Portal>
+                 </DropdownMenu.Root>
+diff --git a/web/src/components/RecordingPreview.tsx b/web/src/components/RecordingPreview.tsx
+index 1564b18..e7edf79 100644
+--- a/web/src/components/RecordingPreview.tsx
++++ b/web/src/components/RecordingPreview.tsx
+@@ -38,6 +38,8 @@ import { Button } from "./ui/button";
+ import { RecordingBookmarks } from "./RecordingBookmarks";
+ import { SaveTranscriptDialog } from "./NoteDialogs";
+ import { api, type Recording } from "@/lib/api";
++import { activeJobFor, DATA_CHANGED, useActivity } from "@/lib/activity";
++import { JobProgressPanel } from "./JobProgress";
+ import { apiUrl, authenticatedHeaders, getRuntime } from "@/lib/runtime";
+ import {
+   exportDocument,
+@@ -88,6 +90,15 @@ export function RecordingPreview({
+     wave = useRef<WaveSurfer | null>(null),
+     audioUrl = useRef("");
+   const navigate = useNavigate();
++  // Reload when a transcription for any recording starts or ends, so this pane never goes stale.
++  const [dataTick, setDataTick] = useState(0);
++  useEffect(() => {
++    const bump = () => setDataTick((value) => value + 1);
++    window.addEventListener(DATA_CHANGED, bump);
++    return () => window.removeEventListener(DATA_CHANGED, bump);
++  }, []);
++  const { jobs } = useActivity();
++  const job = activeJobFor(jobs, id);
+   useEffect(() => {
+     let disposed = false;
+     api
+@@ -105,7 +116,7 @@ export function RecordingPreview({
+     return () => {
+       disposed = true;
+     };
+-  }, [id, metadataRefresh]);
++  }, [id, metadataRefresh, dataTick]);
+   useEffect(() => {
+     if (!container.current) return;
+     let disposed = false,
+@@ -531,6 +542,10 @@ export function RecordingPreview({
+                 {recording.transcriptText}
+               </ReactMarkdown>
+             </div>
++          ) : job ? (
++            <div className="preview-empty">
++              <JobProgressPanel job={job} compact />
++            </div>
+           ) : (
+             <div className="preview-empty">
+               <FileAudio />
+diff --git a/web/src/components/TranscribeDialog.tsx b/web/src/components/TranscribeDialog.tsx
+index a37a575..1070747 100644
+--- a/web/src/components/TranscribeDialog.tsx
++++ b/web/src/components/TranscribeDialog.tsx
+@@ -6,6 +6,7 @@ import { aiSettingsApi, profilesApi, type AiSettings, type CostEstimate, type Sp
+ import { PROMPT_LIMIT, describeEstimate, joinLabels, languagesFor, profileFit } from '@/lib/transcription'
+ import { t } from '@/i18n'
+ import { api } from '@/lib/api'
++import { refreshActivity } from '@/lib/activity'
+ import './profiles.css'
+ 
+ export function TranscribeDialog({ recordingId, title, onClose, onQueued }: { recordingId: string; title: string; onClose: () => void; onQueued: () => void }) {
+@@ -36,7 +37,7 @@ export function TranscribeDialog({ recordingId, title, onClose, onQueued }: { re
+     event.preventDefault(); if (!settings) return; setBusy(true); setError('')
+     try {
+       await api.transcribe(recordingId, { ...overrides, ...(costAccepted ? { confirmCost: true } : {}) })
+-      onQueued(); onClose()
++      refreshActivity(); onQueued(); onClose()
+     } catch (e) { setError(e instanceof Error ? e.message : t('Could not queue transcription.')) } finally { setBusy(false) }
+   }}>
+     {settings && capability ? <>
+diff --git a/web/src/i18n/fr.ts b/web/src/i18n/fr.ts
+index 112bb75..82ccd91 100644
+--- a/web/src/i18n/fr.ts
++++ b/web/src/i18n/fr.ts
+@@ -2,6 +2,7 @@ import { workspace } from './fr/workspace'
+ import { studio } from './fr/studio'
+ import { documents } from './fr/documents'
+ import { devices } from './fr/devices'
++import { pipeline } from './fr/pipeline'
+ 
+ /** French UI strings, keyed by the English source string. Each area keeps its own file. */
+-export const fr: Record<string, string> = { ...workspace, ...studio, ...documents, ...devices }
++export const fr: Record<string, string> = { ...workspace, ...studio, ...documents, ...devices, ...pipeline }
+diff --git a/web/src/i18n/fr/pipeline.ts b/web/src/i18n/fr/pipeline.ts
+new file mode 100644
+index 0000000..6d9c2fc
+--- /dev/null
++++ b/web/src/i18n/fr/pipeline.ts
+@@ -0,0 +1,45 @@
++/** French strings for the local pipeline settings and for transcription progress and notifications. */
++export const pipeline: Record<string, string> = {
++  // Local pipeline settings
++  'After each local-pipeline transcript, copy its files to the export folder': 'Après chaque transcription du pipeline local, copier ses fichiers dans le dossier d’export',
++  'Detect automatically: Vulkan build first, then CPU': 'Détection automatique : version Vulkan d’abord, puis CPU',
++  'Found.': 'Trouvé.',
++  'Local pipeline': 'Pipeline local',
++  'No nemo-speech build found.': 'Aucune version de nemo-speech trouvée.',
++  'Not found at {path}.': 'Introuvable à {path}.',
++  'One folder per recording, named YYYY-MM-DD_HHMM_meeting from its start time. Needs speaker labels on.': 'Un dossier par enregistrement, nommé YYYY-MM-DD_HHMM_meeting d’après son heure de début. Nécessite l’identification des intervenants.',
++  'Pipeline Python (venv with faster-whisper)': 'Python du pipeline (venv avec faster-whisper)',
++  'Work folder': 'Dossier de travail',
++  'faster-whisper speech to text with Nemotron-3 speaker labels, run on this computer at below-normal priority. Leave a field empty to use the default shown. Only the desktop app can change these paths.': 'Reconnaissance vocale faster-whisper avec identification des intervenants Nemotron-3, exécutée sur cet ordinateur en priorité inférieure à la normale. Laissez un champ vide pour utiliser la valeur par défaut affichée. Seule l’application de bureau peut modifier ces chemins.',
++  'nemo-speech.exe (speaker labels)': 'nemo-speech.exe (intervenants)',
++  '{count} build found; the next one is tried if one fails.': '{count} version trouvée ; la suivante est essayée en cas d’échec.',
++  '{count} builds found; the next one is tried if one fails.': '{count} versions trouvées ; la suivante est essayée en cas d’échec.',
++  'Install the pipeline Python (faster-whisper) and NeMo-Speech.cpp, then check the paths in Settings, AI providers, Local pipeline. OpenPlod never downloads models for you.': 'Installez le Python du pipeline (faster-whisper) et NeMo-Speech.cpp, puis vérifiez les chemins dans Réglages, Fournisseurs IA, Pipeline local. OpenPlod ne télécharge jamais de modèles à votre place.',
++  'Runs on this computer. faster-whisper large-v3-turbo with Nemotron-3 speaker labels; needs the pipeline Python and NeMo-Speech.cpp.': 'S’exécute sur cet ordinateur. faster-whisper large-v3-turbo avec identification des intervenants Nemotron-3 ; nécessite le Python du pipeline et NeMo-Speech.cpp.',
++  'The local pipeline is installed.': 'Le pipeline local est installé.',
++  'I understand the audio is transcribed again on this computer with {provider}, which can take a while.': 'Je comprends que l’audio est de nouveau transcrit sur cet ordinateur avec {provider}, ce qui peut prendre du temps.',
++  'Local pipeline (faster-whisper + Nemotron-3)': 'Pipeline local (faster-whisper + Nemotron-3)',
++  'Powered by the local pipeline': 'Avec le pipeline local',
++  // Progress, status and notifications
++  'Queued for transcription': 'En attente de transcription',
++  'Starts when the transcription before it finishes.': 'Démarre quand la transcription précédente est terminée.',
++  'Step {step} of {steps}: {name}': 'Étape {step} sur {steps} : {name}',
++  '{time} elapsed': '{time} écoulé',
++  'Clear notifications': 'Effacer les notifications',
++  'No notifications yet.': 'Aucune notification pour l’instant.',
++  'Notifications ({count} new)': 'Notifications ({count} nouvelles)',
++  'Recording imported': 'Enregistrement importé',
++  'A recording': 'Un enregistrement',
++  'Merging': 'Fusion',
++  'Not transcribed': 'Non transcrit',
++  'Queued': 'En attente',
++  'Speech to text': 'Reconnaissance vocale',
++  'Transcript ready': 'Transcription prête',
++  'Transcription failed': 'Échec de la transcription',
++  'about {span} left': 'environ {span} restantes',
++  '{count} min': '{count} min',
++  '{count} queued': '{count} en attente',
++  '{count} s': '{count} s',
++  '{hours} h {minutes} min': '{hours} h {minutes} min',
++  'Untitled': 'Sans titre',
++}
+diff --git a/web/src/lib/activity.test.ts b/web/src/lib/activity.test.ts
+new file mode 100644
+index 0000000..ead193d
+--- /dev/null
++++ b/web/src/lib/activity.test.ts
+@@ -0,0 +1,50 @@
++import { describe, expect, test } from 'bun:test'
++import { activeJobFor, failedJobFor, jobProgress, progressText, recordingState, type ActivityJob } from './activity'
++import { displayRecordingName, plaudSessionStart } from './api'
++
++const started = '2026-11-22T08:00:00.000Z'
++const at = (seconds: number) => Date.parse(started) + seconds * 1000
++const job = (over: Partial<ActivityJob>): ActivityJob => ({ id: 'j1', recordingId: 'r1', status: 'running', startedAt: started, ...over })
++
++describe('transcription progress', () => {
++  test('local pipeline step 1 gives a percent and, after 15 s, the time left', () => {
++    const running = job({ checkpoint: { phase: 'pipeline step 1 of 3: speech to text', progress: { done: 25, total: 100 } } })
++    expect(jobProgress(running, at(60))).toMatchObject({ step: 1, steps: 3, stepLabel: 'Speech to text', percent: 25, elapsedSec: 60, remainingSec: 180 })
++    expect(jobProgress(running, at(10)).remainingSec).toBeNull()
++    expect(progressText(running, at(60))).toBe('Speech to text 25% · about 3 min left')
++  })
++  test('later pipeline steps show their name without a percent', () => {
++    const p = jobProgress(job({ checkpoint: { phase: 'pipeline step 2 of 3: speaker labels', progress: { done: 0, total: 100 } } }), at(90))
++    expect(p).toMatchObject({ step: 2, stepLabel: 'Speaker labels', percent: null, remainingSec: null })
++  })
++  test('cloud engines report chunks as a percent; queued jobs say Queued', () => {
++    expect(jobProgress(job({ checkpoint: { phase: 'transcribing', progress: { done: 1, total: 4 } } }), at(30)).percent).toBe(25)
++    expect(progressText(job({ status: 'pending', startedAt: undefined }))).toBe('Queued')
++  })
++})
++
++describe('recording state', () => {
++  const recording = { id: 'r1', status: 'pending', hasTranscript: false }
++  test('"pending" without a job means not transcribed; with a job, queued or transcribing', () => {
++    expect(recordingState(recording, [])).toBe('not-transcribed')
++    expect(recordingState(recording, [job({ status: 'pending' })])).toBe('queued')
++    expect(recordingState(recording, [job({})])).toBe('transcribing')
++    expect(recordingState({ ...recording, status: 'complete', hasTranscript: true }, [])).toBe('complete')
++  })
++  test('the latest ended job decides failed; comparison runs never count', () => {
++    const failed = job({ id: 'a', status: 'failed', completedAt: '2026-11-22T08:05:00.000Z', error: 'boom' })
++    expect(recordingState(recording, [failed])).toBe('failed')
++    expect(failedJobFor([failed, job({ id: 'b', status: 'complete', completedAt: '2026-11-22T08:06:00.000Z' })], 'r1')).toBeUndefined()
++    expect(activeJobFor([job({ dedupeKey: 'compare:x' })], 'r1')).toBeUndefined()
++  })
++})
++
++describe('recording names', () => {
++  test('a file named by its Plaud session shows the recording time; other names are kept', () => {
++    const start = plaudSessionStart('SN0000TEST:1795000000', 'Plaud-1795000000.m4a')
++    expect(start?.toISOString()).toBe('2026-11-18T11:06:40.000Z')
++    expect(displayRecordingName('Plaud-1795000000.m4a', 'SN0000TEST:1795000000')).not.toContain('1795000000')
++    expect(displayRecordingName('Weekly sync.m4a', null)).toBe('Weekly sync')
++    expect(displayRecordingName('team_review-notes.ogg', null)).toBe('team review notes')
++  })
++})
+diff --git a/web/src/lib/activity.ts b/web/src/lib/activity.ts
+new file mode 100644
+index 0000000..d541912
+--- /dev/null
++++ b/web/src/lib/activity.ts
+@@ -0,0 +1,288 @@
++/**
++ * Live processing activity: one poller for the job list that every screen shares.
++ *
++ * - Polls `/api/jobs?active=1` every 2.5 s while a job is queued or running, every 15 s otherwise.
++ * - When a job ends, fires DATA_CHANGED (lists, counts and pages reload) and adds a notification.
++ * - On the desktop app it also shows progress on the taskbar button and in the tray tooltip, and a
++ *   Windows notification when a transcription ends while OpenPlod is not in front.
++ */
++import { useSyncExternalStore } from 'react'
++import { apiUrl, authenticatedHeaders, getRuntime } from '@/lib/runtime'
++import { displayRecordingName } from '@/lib/api'
++import { t } from '@/i18n'
++
++export const DATA_CHANGED = 'openplod:data-changed'
++
++export type ActivityJob = {
++  id: string
++  recordingId?: string
++  provider?: string
++  status: 'pending' | 'running' | 'complete' | 'failed' | 'cancelled'
++  error?: string
++  createdAt?: string
++  startedAt?: string
++  completedAt?: string
++  /** Set for extra comparison runs, which never change the recording itself. */
++  dedupeKey?: string
++  checkpoint?: { phase?: string; progress?: { done: number; total: number } }
++  recordingFilename?: string | null
++  sourceRecordingId?: string | null
++}
++
++export type ActivityNotice = {
++  id: string
++  kind: 'transcribed' | 'failed' | 'imported'
++  title: string
++  detail?: string
++  recordingId?: string
++  at: number
++  read: boolean
++}
++
++type Snapshot = { jobs: ActivityJob[]; notices: ActivityNotice[]; now: number; loaded: boolean }
++
++const NOTICES_KEY = 'openplod.activity.notices'
++const MAX_NOTICES = 30
++const FAST_MS = 2500
++const IDLE_MS = 15000
++const ACTIVE = new Set(['pending', 'running'])
++
++function readNotices(): ActivityNotice[] {
++  try {
++    const rows = JSON.parse(localStorage.getItem(NOTICES_KEY) || '[]')
++    return Array.isArray(rows) ? rows.filter(row => row && typeof row.id === 'string' && typeof row.title === 'string').slice(0, MAX_NOTICES) : []
++  } catch { return [] }
++}
++
++let snapshot: Snapshot = { jobs: [], notices: readNotices(), now: Date.now(), loaded: false }
++const listeners = new Set<() => void>()
++let previous = new Map<string, ActivityJob['status']>()
++let started = false
++let timer: number | null = null
++let polling = false
++
++function publish(next: Partial<Snapshot>) {
++  snapshot = { ...snapshot, ...next }
++  if (next.notices) {
++    try { localStorage.setItem(NOTICES_KEY, JSON.stringify(snapshot.notices)) } catch { /* Notices still show for this session. */ }
++  }
++  for (const listener of listeners) listener()
++}
++
++const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener) } }
++const getSnapshot = () => snapshot
++
++/** The shared activity state; components re-render when it changes. */
++export function useActivity(): Snapshot {
++  return useSyncExternalStore(subscribe, getSnapshot)
++}
++
++export function addNotice(notice: Omit<ActivityNotice, 'id' | 'at' | 'read'>) {
++  const row: ActivityNotice = { ...notice, id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, at: Date.now(), read: false }
++  publish({ notices: [row, ...snapshot.notices].slice(0, MAX_NOTICES) })
++}
++
++export function markNoticesRead() {
++  if (snapshot.notices.some(row => !row.read)) publish({ notices: snapshot.notices.map(row => ({ ...row, read: true })) })
++}
++
++export function clearNotices() {
++  publish({ notices: [] })
++}
++
++/** Name to show for the recording a job belongs to. */
++export function jobTitle(job: ActivityJob): string {
++  return job.recordingFilename || job.sourceRecordingId ? displayRecordingName(job.recordingFilename, job.sourceRecordingId) : t('A recording')
++}
++
++/** The queued or running job for a recording, ignoring extra comparison runs. */
++export function activeJobFor(jobs: ActivityJob[], recordingId: string | undefined): ActivityJob | undefined {
++  if (!recordingId) return undefined
++  return jobs.find(job => job.recordingId === recordingId && !job.dedupeKey && job.status === 'running')
++    ?? jobs.find(job => job.recordingId === recordingId && !job.dedupeKey && job.status === 'pending')
++}
++
++/** The most recent failed job for a recording, when nothing newer is queued. */
++export function failedJobFor(jobs: ActivityJob[], recordingId: string | undefined): ActivityJob | undefined {
++  if (!recordingId || activeJobFor(jobs, recordingId)) return undefined
++  const ended = jobs.filter(job => job.recordingId === recordingId && !job.dedupeKey && !ACTIVE.has(job.status))
++    .sort((a, b) => Date.parse(b.completedAt || '') - Date.parse(a.completedAt || ''))
++  return ended[0]?.status === 'failed' ? ended[0] : undefined
++}
++
++export type JobProgress = {
++  queued: boolean
++  /** Step number and count for the local pipeline; null for other engines. */
++  step: number | null
++  steps: number | null
++  stepLabel: string
++  /** Percent of the current step, or null when the step reports none. */
++  percent: number | null
++  elapsedSec: number | null
++  remainingSec: number | null
++}
++
++const STEP_LABELS: Record<string, () => string> = {
++  'speech to text': () => t('Speech to text'),
++  'speaker labels': () => t('Speaker labels'),
++  merge: () => t('Merging'),
++}
++
++export function jobProgress(job: ActivityJob, now = Date.now()): JobProgress {
++  const phase = job.checkpoint?.phase ?? ''
++  const progress = job.checkpoint?.progress
++  const startedAt = job.startedAt ? Date.parse(job.startedAt) : NaN
++  const elapsedSec = job.status === 'running' && Number.isFinite(startedAt) ? Math.max(0, (now - startedAt) / 1000) : null
++  const pipeline = /^pipeline step (\d+) of (\d+): (.+)$/.exec(phase)
++  let step: number | null = null, steps: number | null = null, stepLabel = job.status === 'pending' ? t('Queued') : t('Transcribing'), percent: number | null = null
++  if (pipeline) {
++    step = Number(pipeline[1]); steps = Number(pipeline[2])
++    stepLabel = STEP_LABELS[pipeline[3]]?.() ?? pipeline[3]
++    // Only speech to text reports a percent; the later steps take seconds.
++    if (step === 1 && progress && progress.total > 0) percent = Math.min(100, Math.round(progress.done / progress.total * 100))
++  } else if (progress && progress.total > 1) {
++    percent = Math.min(100, Math.round(progress.done / progress.total * 100))
++  }
++  const remainingSec = percent !== null && percent >= 3 && percent < 100 && elapsedSec !== null && elapsedSec >= 15
++    ? elapsedSec * (100 - percent) / percent : null
++  return { queued: job.status === 'pending', step, steps, stepLabel, percent, elapsedSec, remainingSec }
++}
++
++/** "42 s", "3 min", "1 h 5 min". */
++export function formatSpan(seconds: number): string {
++  if (seconds < 60) return t('{count} s', { count: Math.max(1, Math.round(seconds)) })
++  const minutes = Math.round(seconds / 60)
++  if (minutes < 60) return t('{count} min', { count: minutes })
++  return t('{hours} h {minutes} min', { hours: Math.floor(minutes / 60), minutes: minutes % 60 })
++}
++
++/** One line for a running or queued job, e.g. "Speech to text 42% · about 3 min left". */
++export function progressText(job: ActivityJob, now = Date.now()): string {
++  const p = jobProgress(job, now)
++  if (p.queued) return t('Queued')
++  const parts = [p.percent !== null ? `${p.stepLabel} ${p.percent}%` : p.stepLabel]
++  if (p.remainingSec !== null) parts.push(t('about {span} left', { span: formatSpan(p.remainingSec) }))
++  return parts.join(' · ')
++}
++
++export type RecordingState = 'queued' | 'transcribing' | 'summarizing' | 'failed' | 'not-transcribed' | 'complete'
++
++/** What a recording's status means once its jobs are known: "pending" alone is ambiguous. */
++export function recordingState(recording: { id: string; status: string; hasTranscript?: boolean; transcriptText?: string }, jobs: ActivityJob[]): RecordingState {
++  const job = activeJobFor(jobs, recording.id)
++  if (job) return job.status === 'running' ? 'transcribing' : 'queued'
++  if (recording.status === 'failed' || failedJobFor(jobs, recording.id)) return 'failed'
++  if (recording.status === 'transcribing') return 'transcribing'
++  if (recording.status === 'summarizing') return 'summarizing'
++  const transcribed = recording.hasTranscript ?? Boolean(recording.transcriptText?.trim())
++  return transcribed ? 'complete' : 'not-transcribed'
++}
++
++export function recordingStateLabel(state: RecordingState): string {
++  return {
++    queued: t('Queued'), transcribing: t('Transcribing'), summarizing: t('Summarizing'), failed: t('Failed'),
++    'not-transcribed': t('Not transcribed'), complete: t('Complete'),
++  }[state]
++}
++
++// ---------------------------------------------------------------------------------------------
++// Polling
++
++async function poll() {
++  if (polling) return
++  polling = true
++  let jobs: ActivityJob[] | null = null
++  try {
++    const response = await fetch(apiUrl('/jobs?active=1'), { headers: authenticatedHeaders(), signal: AbortSignal.timeout(8000) })
++    if (response.ok) {
++      const payload = await response.json()
++      if (payload?.success && Array.isArray(payload.data)) jobs = payload.data as ActivityJob[]
++    }
++  } catch { /* The service may be restarting; the next poll retries. */ }
++  polling = false
++  if (jobs) {
++    const now = Date.now()
++    let changed = false
++    const notices: ActivityNotice[] = []
++    for (const job of jobs) {
++      const before = previous.get(job.id)
++      if (before !== job.status) changed = true
++      if (before && ACTIVE.has(before) && !ACTIVE.has(job.status) && !job.dedupeKey) {
++        if (job.status === 'complete') notices.push({ id: `${job.id}-done`, kind: 'transcribed', title: jobTitle(job), detail: t('Transcript ready'), recordingId: job.recordingId, at: now, read: false })
++        if (job.status === 'failed') notices.push({ id: `${job.id}-failed`, kind: 'failed', title: jobTitle(job), detail: job.error || t('Transcription failed'), recordingId: job.recordingId, at: now, read: false })
++      }
++    }
++    for (const id of previous.keys()) if (!jobs.some(job => job.id === id)) changed = true
++    previous = new Map(jobs.map(job => [job.id, job.status]))
++    const firstLoad = !snapshot.loaded
++    if (firstLoad) changed = false
++    publish({ jobs, now, loaded: true, ...(notices.length ? { notices: [...notices, ...snapshot.notices].slice(0, MAX_NOTICES) } : {}) })
++    if (changed) window.dispatchEvent(new Event(DATA_CHANGED))
++    for (const notice of notices) void notifyDesktop(notice)
++    void syncDesktop(jobs, now)
++  }
++  schedule()
++}
++
++function schedule() {
++  if (timer !== null) window.clearTimeout(timer)
++  const busy = snapshot.jobs.some(job => ACTIVE.has(job.status))
++  timer = window.setTimeout(() => void poll(), busy ? FAST_MS : IDLE_MS)
++}
++
++/** Starts the shared poller once (the app layout calls this). */
++export function startActivity() {
++  if (started) return
++  started = true
++  void poll()
++}
++
++/** Polls now, e.g. right after a transcription was queued. */
++export function refreshActivity() {
++  if (!started) { startActivity(); return }
++  void poll()
++}
++
++// ---------------------------------------------------------------------------------------------
++// Desktop: taskbar progress, tray tooltip, Windows notifications
++
++let lastBar = ''
++let lastTooltip = ''
++
++async function syncDesktop(jobs: ActivityJob[], now: number) {
++  if (getRuntime().mode !== 'desktop') return
++  const running = jobs.find(job => job.status === 'running' && !job.dedupeKey)
++  const queued = jobs.filter(job => job.status === 'pending' && !job.dedupeKey).length
++  const progress = running ? jobProgress(running, now) : null
++  const bar = running ? (progress?.percent !== null && progress?.percent !== undefined ? `normal:${progress.percent}` : 'indeterminate') : queued ? 'indeterminate' : 'none'
++  if (bar !== lastBar) {
++    lastBar = bar
++    try {
++      const { getCurrentWindow, ProgressBarStatus } = await import('@tauri-apps/api/window')
++      await getCurrentWindow().setProgressBar(bar === 'none' ? { status: ProgressBarStatus.None }
++        : bar === 'indeterminate' ? { status: ProgressBarStatus.Indeterminate }
++        : { status: ProgressBarStatus.Normal, progress: progress?.percent ?? 0 })
++    } catch { /* Older shells without the permission: no taskbar progress. */ }
++  }
++  let tooltip = 'OpenPlod'
++  if (running) tooltip = `OpenPlod: ${jobTitle(running)}, ${progressText(running, now)}`
++  if (queued) tooltip += running ? `, ${t('{count} queued', { count: queued })}` : `: ${t('{count} queued', { count: queued })}`
++  tooltip = tooltip.length > 120 ? `${tooltip.slice(0, 119)}…` : tooltip
++  if (tooltip !== lastTooltip) {
++    lastTooltip = tooltip
++    try {
++      const { TrayIcon } = await import('@tauri-apps/api/tray')
++      await (await TrayIcon.getById('openplod'))?.setTooltip(tooltip)
++    } catch { /* No tray (or no permission): nothing to update. */ }
++  }
++}
++
++async function notifyDesktop(notice: ActivityNotice) {
++  if (getRuntime().mode !== 'desktop' || document.hasFocus()) return
++  try {
++    const notification = await import('@tauri-apps/plugin-notification')
++    let granted = await notification.isPermissionGranted()
++    if (!granted) granted = (await notification.requestPermission()) === 'granted'
++    if (granted) notification.sendNotification({ title: notice.kind === 'failed' ? t('Transcription failed') : t('Transcript ready'), body: notice.kind === 'failed' ? `${notice.title}: ${notice.detail ?? ''}` : notice.title })
++  } catch { /* Notifications are optional. */ }
++}
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 7d9152a..4e848d2 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -1,7 +1,11 @@
+-import { t } from '@/i18n'
++import { formatDate, t } from '@/i18n'
+ export interface Recording {
+   id: string
+   title: string
++  /** Name to show: the recording time when the file is still named by its Plaud session number. */
++  displayTitle: string
++  /** When the audio was recorded (the Plaud session time when known), for display and sorting. */
++  startedAt: string
+   filename: string
+   filePath: string
+   duration: number
+@@ -515,6 +519,26 @@ async function fetchJSON<T>(url: string, opts?: RequestInit): Promise<T> {
+ export const speakerLabel = (speaker: number | string | null | undefined) =>
+   typeof speaker === 'string' ? speaker : speaker !== undefined && speaker !== null ? t('Speaker {number}', { number: speaker }) : t('Speaker')
+ 
++/** Start time of a Plaud Bluetooth recording: the session number (Unix seconds) at the end of its source ID. */
++export function plaudSessionStart(sourceRecordingId?: string | null, filename?: string | null): Date | null {
++  const match = /:(\d{9,11})$/.exec(sourceRecordingId ?? '') ?? /^plaud[\s_-]*(\d{9,11})(\.[^.]+)?$/i.exec(filename ?? '')
++  if (!match) return null
++  const start = new Date(Number(match[1]) * 1000)
++  return Number.isNaN(start.getTime()) ? null : start
++}
++
++/**
++ * The name shown for a recording. A file still named by its Plaud session number ("Plaud-1795000000")
++ * shows when it was recorded instead; any other name is shown as is. Display only: the stored file
++ * name and the editable title are unchanged.
++ */
++export function displayRecordingName(filename?: string | null, sourceRecordingId?: string | null): string {
++  const base = filename?.replace(/\.[^.]+$/, '') ?? ''
++  const start = /^plaud[\s_-]*\d{9,11}$/i.test(base) ? plaudSessionStart(sourceRecordingId, filename) : null
++  if (start) return formatDate(start, { dateStyle: 'medium', timeStyle: 'short' })
++  return base.replace(/[-_]/g, ' ') || t('Untitled')
++}
++
+ /** Map backend recording shape to frontend Recording */
+ function mapRecording(r: RawRecording): Recording {
+   const transcript = r.transcript
+@@ -555,6 +579,8 @@ function mapRecording(r: RawRecording): Recording {
+   return {
+     id: r.id,
+     title: r.originalFilename?.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ') || 'Untitled',
++    displayTitle: displayRecordingName(r.originalFilename, r.sourceRecordingId),
++    startedAt: plaudSessionStart(r.sourceRecordingId, r.originalFilename)?.toISOString() ?? (r.recordedAt || r.uploadedAt || ''),
+     filename: r.originalFilename || '',
+     filePath: r.filePath || '',
+     duration: r.durationSeconds || 0,
+diff --git a/web/src/pages/Dashboard.tsx b/web/src/pages/Dashboard.tsx
+index a18de37..2b5612d 100644
+--- a/web/src/pages/Dashboard.tsx
++++ b/web/src/pages/Dashboard.tsx
+@@ -51,6 +51,9 @@ import { formatDate, t, tn } from "@/i18n";
+ import { BatchTranscribe } from '@/components/BatchTranscribe'
+ import { COLLECTIONS_EVENT, CollectionContextSubmenu, CollectionDropdownSubmenu, CollectionNameDialog } from '@/components/RecordingCollections'
+ import { knowledgeApi, type RecordingCollection } from '@/lib/knowledge'
++import { activeJobFor, DATA_CHANGED, failedJobFor, recordingState, refreshActivity, useActivity } from '@/lib/activity'
++import { RecordingStateChip } from '@/components/JobProgress'
++import { TranscribeDialog } from '@/components/TranscribeDialog'
+ 
+ export function Dashboard() {
+   const [recordings, setRecordings] = useState<Recording[]>([]),
+@@ -129,11 +132,15 @@ export function Dashboard() {
+   useEffect(() => {
+     void load();
+     window.addEventListener("plaud:sync-complete", load);
++    window.addEventListener(DATA_CHANGED, load);
+     return () => {
+       invalidate();
+       window.removeEventListener("plaud:sync-complete", load);
++      window.removeEventListener(DATA_CHANGED, load);
+     };
+   }, [load, invalidate]);
++  const { jobs } = useActivity();
++  const [transcribing, setTranscribing] = useState<Recording | null>(null);
+   const search = useDeferredValue(query.toLocaleLowerCase());
+   const filtered = useMemo(
+     () =>
+@@ -457,6 +464,13 @@ export function Dashboard() {
+                     <strong>{row.title}</strong>
+                   </button>
+                   <div className="studio-row-tags">
++                    {retention === "active" && (
++                      <RecordingStateChip
++                        state={recordingState(row, jobs)}
++                        job={activeJobFor(jobs, row.id) ?? failedJobFor(jobs, row.id)}
++                        onRetry={() => setTranscribing(row)}
++                      />
++                    )}
+                     {(row.tags.filter((tag) => tag !== "Starred").length
+                       ? row.tags.filter((tag) => tag !== "Starred")
+                       : [
+@@ -587,6 +601,14 @@ export function Dashboard() {
+             )
+           ))}
+       </div>
++      {transcribing && (
++        <TranscribeDialog
++          recordingId={transcribing.id}
++          title={transcribing.title}
++          onClose={() => setTranscribing(null)}
++          onQueued={() => { refreshActivity(); void load(); }}
++        />
++      )}
+       {tagRecording && <RecordingTagsDialog recording={tagRecording} onClose={closeTags} onSaved={updated => {
+         invalidate();
+         setRecordings(current => current.map(row => row.id === updated.id ? { ...row, ...updated } : row));
+diff --git a/web/src/pages/RecordingDetail.tsx b/web/src/pages/RecordingDetail.tsx
+index b2226d0..b46a378 100644
+--- a/web/src/pages/RecordingDetail.tsx
++++ b/web/src/pages/RecordingDetail.tsx
+@@ -46,6 +46,8 @@ import { formatDuration } from '@/lib/utils'
+ import { formatDate, t } from '@/i18n'
+ import { exportDocument, exportOriginalAudio, recordingMarkdown, safeDocumentName as safeName } from '@/lib/document-export'
+ import { deviceCommand, supportsPlaudDevice, vaultArguments } from '@/lib/plaud-device'
++import { activeJobFor, DATA_CHANGED, recordingState, recordingStateLabel, useActivity, type ActivityJob } from '@/lib/activity'
++import { JobProgressPanel } from '@/components/JobProgress'
+ 
+ type BusyAction = 'transcribing' | 'summarizing' | 'saving' | 'forwarding' | null
+ type DocumentMode = 'preview' | 'edit' | 'timestamps' | 'studio'
+@@ -150,6 +152,14 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+     const poll = window.setInterval(() => void loadRecording(false), status === 'pending' ? 15000 : 2500)
+     return () => window.clearInterval(poll)
+   }, [loadRecording, status])
++  // A job that ends (or starts) anywhere reloads this page at once instead of on the next slow poll.
++  useEffect(() => {
++    const reload = () => void loadRecording(false)
++    window.addEventListener(DATA_CHANGED, reload)
++    return () => window.removeEventListener(DATA_CHANGED, reload)
++  }, [loadRecording])
++  const { jobs } = useActivity()
++  const job = activeJobFor(jobs, id)
+ 
+   useEffect(() => {
+     if (!id || !audioKey) return
+@@ -449,13 +459,14 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+             <div className="version-banner"><History /><span>{selectedVersion.origin === 'edited' ? t('Viewing edited version from {date}', { date: formatVersionDate(selectedVersion.createdAt) }) : t('Viewing generated version from {date}', { date: formatVersionDate(selectedVersion.createdAt) })}</span><button type="button" onClick={() => setSelectedVersion(null)}>{t('Back to current')}</button></div>
+           )}
+ 
++          {job && recording.transcriptText && <div className="px-6 pt-4"><JobProgressPanel job={job} /></div>}
+           <article className="document-surface">
+             {documentMode === 'studio' ? (
+               <TranscriptStudio recording={recording} onChanged={loadRecording} />
+             ) : documentMode === 'edit' ? (
+               recording.transcriptText !== undefined ? (
+                 <textarea className="markdown-editor" aria-label={t('Transcript Markdown')} value={transcriptDraft} onChange={event => setTranscriptDraft(event.target.value)} spellCheck />
+-              ) : <TranscriptEmpty action={action} onTranscribe={() => void runAction('transcribing')} />
++              ) : <TranscriptEmpty action={action} job={job} onTranscribe={() => void runAction('transcribing')} />
+             ) : documentMode === 'timestamps' ? (
+               displaySegments.length ? (
+                 <>
+@@ -481,10 +492,10 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+                   ))}
+                 </div>
+                 </>
+-              ) : displayText ? <p className="p-6 text-sm text-muted-foreground">{t('This transcript version has no timestamp data. Its text is available in Markdown.')}</p> : <TranscriptEmpty action={action} onTranscribe={() => void runAction('transcribing')} />
++              ) : displayText ? <p className="p-6 text-sm text-muted-foreground">{t('This transcript version has no timestamp data. Its text is available in Markdown.')}</p> : <TranscriptEmpty action={action} job={job} onTranscribe={() => void runAction('transcribing')} />
+             ) : displayText ? (
+               <div className="markdown-document">{transcriptMarkdown}</div>
+-            ) : <TranscriptEmpty action={action} onTranscribe={() => void runAction('transcribing')} />}
++            ) : <TranscriptEmpty action={action} job={job} onTranscribe={() => void runAction('transcribing')} />}
+           </article>
+         </main>
+ 
+@@ -501,7 +512,7 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+               </div>
+             ) : (
+               <dl className="metadata-list">
+-                <div><dt>{t('Status')}</dt><dd><Badge variant={recording.status === 'complete' ? 'success' : recording.status === 'failed' ? 'destructive' : 'warning'}>{statusLabel(recording.status)}</Badge></dd></div>
++                <div><dt>{t('Status')}</dt><dd>{(() => { const state = recordingState(recording, jobs); return <Badge variant={state === 'complete' ? 'success' : state === 'failed' ? 'destructive' : state === 'not-transcribed' ? 'secondary' : 'warning'}>{recordingStateLabel(state)}</Badge> })()}</dd></div>
+                 <div><dt>{t('Duration')}</dt><dd>{formatDuration(duration || recording.duration)}</dd></div>
+                 <div><dt>{t('Context')}</dt><dd>{recording.context || t('None')}</dd></div>
+                 <div><dt>{t('Tags')}</dt><dd>{recording.tags.length ? recording.tags.join(', ') : t('None')}</dd></div>
+@@ -547,7 +558,8 @@ export function RecordingDetail({ backPath = '/' }: { backPath?: string }) {
+   )
+ }
+ 
+-function TranscriptEmpty({ action, onTranscribe }: { action: BusyAction; onTranscribe: () => void }) {
++function TranscriptEmpty({ action, job, onTranscribe }: { action: BusyAction; job?: ActivityJob; onTranscribe: () => void }) {
++  if (job) return <div className="document-empty"><JobProgressPanel job={job} /></div>
+   return (
+     <div className="document-empty">
+       <FileText />
+@@ -570,10 +582,6 @@ function formatVersionDate(value: string): string {
+   return formatDate(date, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+ }
+ 
+-function statusLabel(status: Recording['status']): string {
+-  return { pending: t('Pending'), transcribing: t('Transcribing'), summarizing: t('Summarizing'), complete: t('Complete'), failed: t('Failed') }[status] ?? status
+-}
+-
+ function flashSaved(setSaved: (value: boolean) => void) {
+   setSaved(true)
+   window.setTimeout(() => setSaved(false), 1800)
