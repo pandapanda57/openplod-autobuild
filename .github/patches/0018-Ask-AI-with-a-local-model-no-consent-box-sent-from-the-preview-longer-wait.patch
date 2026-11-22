@@ -1,0 +1,166 @@
+Subject: [PATCH] Ask AI with a local model: no consent box, sent from the preview, longer wait
+
+A question asked from a recording's preview (or its Summary and Action items buttons) used to open
+AI Chat with the question filled in and wait for a consent box, so nothing was sent. With a model on
+this computer (Ollama, LM Studio) no transcript leaves the computer, so the consent box is replaced
+by a note and the question is sent at once; a cloud provider still asks for consent. Local models get
+up to 5 minutes per request (cloud stays at 90 seconds) and AI Chat waits up to 5.5 minutes. A JSON
+answer from LM Studio inside a code fence or after a lead-in line is unwrapped instead of failing.
+AI Chat names LM Studio in its header and progress line.
+---
+diff --git a/src/ai/lmstudio.test.ts b/src/ai/lmstudio.test.ts
+index b66ddbd..f437c5f 100644
+--- a/src/ai/lmstudio.test.ts
++++ b/src/ai/lmstudio.test.ts
+@@ -1,6 +1,6 @@
+ import { expect, test } from 'bun:test';
+ import { aiConfigSchema, DEFAULT_LMSTUDIO_URL, isLocalProvider } from './config';
+-import { ContextLimitError, completeText, lmstudioModels } from './text';
++import { ContextLimitError, completeText, jsonBody, lmstudioModels } from './text';
+ import { estimateTextUsd } from './pricing';
+ 
+ const base = 'http://127.0.0.1:1234/v1';
+@@ -61,6 +61,15 @@ test('a model loaded on demand with too small a context: the answer is discarded
+   await expect(completeText({ provider: 'lmstudio', model: 'jit', baseUrl: base }, [{ role: 'user', content: 'word '.repeat(20000) }], {}, fetcher)).rejects.toBeInstanceOf(ContextLimitError);
+ });
+ 
++test('a JSON answer inside a code fence or after a lead-in line is unwrapped', async () => {
++  expect(jsonBody('```json\n{"answer":"x","citations":[]}\n```')).toBe('{"answer":"x","citations":[]}');
++  expect(jsonBody('Here is the JSON:\n{"answer":"x"}')).toBe('{"answer":"x"}');
++  expect(jsonBody('{"answer":"x"}')).toBe('{"answer":"x"}');
++  const { fetcher } = fakeLmStudio([{ id: 'qwen', type: 'llm', state: 'loaded', loaded_context_length: 32768 }], '<think>plan</think>```json\n{"answer":"ok","citations":[]}\n```');
++  const result = await completeText({ provider: 'lmstudio', model: 'qwen', baseUrl: base }, [{ role: 'user', content: 'Q' }], { json: true }, fetcher);
++  expect(JSON.parse(result.text)).toEqual({ answer: 'ok', citations: [] });
++});
++
+ test('a model LM Studio does not offer is refused', async () => {
+   const { fetcher } = fakeLmStudio([{ id: 'other', type: 'llm' }]);
+   await expect(completeText({ provider: 'lmstudio', model: 'missing', baseUrl: base }, [{ role: 'user', content: 'x' }], {}, fetcher)).rejects.toThrow('does not offer the model');
+diff --git a/src/ai/text.ts b/src/ai/text.ts
+index 105ddf4..8768151 100644
+--- a/src/ai/text.ts
++++ b/src/ai/text.ts
+@@ -58,6 +58,16 @@ export async function lmstudioModels(baseUrl: string, fetcher: Fetcher = fetch):
+ }
+ /** Removes a reasoning model's <think> block, which is not part of the answer. */
+ const withoutThinking = (text: string) => text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
++/** The JSON object in a model's answer: the text itself when it parses, else the outermost {...} span. */
++export function jsonBody(text: string): string {
++  const trimmed = text.trim();
++  try { JSON.parse(trimmed); return trimmed; } catch { /* look for the object inside */ }
++  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed)?.[1]?.trim();
++  if (fenced) { try { JSON.parse(fenced); return fenced; } catch { /* fall through */ } }
++  const start = trimmed.indexOf('{'), end = trimmed.lastIndexOf('}');
++  if (start >= 0 && end > start) { const inner = trimmed.slice(start, end + 1); try { JSON.parse(inner); return inner; } catch { /* fall through */ } }
++  return trimmed;
++}
+ 
+ export async function installedOllamaModels(fetcher: Fetcher = fetch): Promise<string[]> {
+   const response = await fetcher(`${OLLAMA}/api/tags`, { redirect: 'error', signal: AbortSignal.timeout(5000) });
+@@ -110,7 +120,9 @@ const isLocalSelection = (selection: TextSelection) => selection.provider === 'o
+ 
+ async function completeOne(selection: TextSelection, messages: TextMessage[], options: { signal?: AbortSignal; timeoutMs?: number; maxTokens?: number; json?: boolean }, fetcher: Fetcher): Promise<TextResult> {
+   const { provider, model, apiKey } = selection;
+-  const signal = AbortSignal.any([AbortSignal.timeout(options.timeoutMs ?? 90000), ...(options.signal ? [options.signal] : [])]);
++  // Models on this computer can take minutes on a long transcript (loading, reasoning); cloud calls get 90 s.
++  const defaultTimeout = provider === 'ollama' || provider === 'lmstudio' ? 300000 : 90000;
++  const signal = AbortSignal.any([AbortSignal.timeout(options.timeoutMs ?? defaultTimeout), ...(options.signal ? [options.signal] : [])]);
+   signal.throwIfAborted();
+   if (!['ollama', 'custom', 'lmstudio'].includes(provider) && !apiKey) throw new Error(`The ${provider} API key is not configured.`);
+   const maxTokens = options.maxTokens ?? 8192;
+@@ -185,6 +197,8 @@ async function completeOne(selection: TextSelection, messages: TextMessage[], op
+       finished = candidate?.finishReason === 'STOP'; usage = payload.usageMetadata; reportedModel = payload.modelVersion;
+     } else { text = payload.choices?.[0]?.message?.content; finished = payload.choices?.[0]?.finish_reason === 'stop'; }
+     if (provider === 'lmstudio' && typeof text === 'string') text = withoutThinking(text);
++    // No JSON mode is requested from LM Studio, so a JSON answer may come inside a ``` fence or with a lead-in line.
++    if (provider === 'lmstudio' && options.json && typeof text === 'string') text = jsonBody(text);
+     if (!finished || typeof text !== 'string' || !text.trim()) throw new Error(`${label(provider)} returned an empty or incomplete response. Nothing was saved.`);
+     if (provider === 'lmstudio') {
+       const info = await lmstudioContext().catch(() => null);
+diff --git a/web/src/i18n/fr/lmstudio.ts b/web/src/i18n/fr/lmstudio.ts
+index 4c04e41..d9b7bb5 100644
+--- a/web/src/i18n/fr/lmstudio.ts
++++ b/web/src/i18n/fr/lmstudio.ts
+@@ -1,6 +1,8 @@
+ /** French strings for LM Studio and for local text providers in general. */
+ export const lmstudio: Record<string, string> = {
+   'Choose an LM Studio model': 'Choisissez un modèle LM Studio',
++  'LM Studio is answering locally': 'LM Studio répond en local',
++  '{name} answers on this computer; nothing is sent elsewhere.': '{name} répond sur cet ordinateur ; rien n’est envoyé ailleurs.',
+   'LM Studio server address': 'Adresse du serveur LM Studio',
+   'Runs on this computer, no API key. Open LM Studio yourself and turn on its local server; OpenPlod never starts it. A model loads on first use, so the first answer can take longer.': 'S’exécute sur cet ordinateur, sans clé API. Ouvrez LM Studio vous-même et activez son serveur local ; OpenPlod ne le démarre jamais. Un modèle se charge à la première utilisation, la première réponse peut donc être plus longue.',
+   'Test connection': 'Tester la connexion',
+diff --git a/web/src/lib/recording-ai.ts b/web/src/lib/recording-ai.ts
+index d9fb680..d6e65be 100644
+--- a/web/src/lib/recording-ai.ts
++++ b/web/src/lib/recording-ai.ts
+@@ -13,7 +13,7 @@ export async function conversationExport(id: string, format: 'md' | 'json'): Pro
+   return response.text()
+ }
+ export async function askRecordings(data: { id: string; conversationId: string; recordingIds: string[]; question: string; consent: true; expectedProvider?: string }, onStage: (stage: string) => void, signal: AbortSignal): Promise<AiAnswer> {
+-  const response = await fetch(apiUrl('/ai/ask'), { method: 'POST', headers: authenticatedHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(data), signal: AbortSignal.any([signal, AbortSignal.timeout(110000)]) })
++  const response = await fetch(apiUrl('/ai/ask'), { method: 'POST', headers: authenticatedHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(data), signal: AbortSignal.any([signal, AbortSignal.timeout(330000)]) })
+   if (!response.ok || !response.body) { const payload = await response.json().catch(() => null); throw new Error(payload?.error || 'AI request failed.') }
+   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+   let buffer = '', answer: AiAnswer | undefined
+diff --git a/web/src/pages/AiPage.tsx b/web/src/pages/AiPage.tsx
+index a8d86b7..85a3253 100644
+--- a/web/src/pages/AiPage.tsx
++++ b/web/src/pages/AiPage.tsx
+@@ -22,7 +22,7 @@ import { aiSettingsApi } from '@/lib/ai-settings'
+ import { formatDate, t, tn } from '@/i18n'
+ import { localTextName } from '@/lib/text-ai'
+ 
+-const stageLabel = (stage: string) => ({ context: t('Reading selected transcripts'), retrieval: t('Searching your recordings'), mistral: t('{provider} is answering', { provider: 'Mistral' }), openai: t('{provider} is answering', { provider: 'OpenAI' }), anthropic: t('{provider} is answering', { provider: 'Anthropic' }), ollama: t('Ollama is answering locally'), citations: t('Checking source citations'), saved: t('Saving answer') } as Record<string, string>)[stage] || stage
++const stageLabel = (stage: string) => ({ context: t('Reading selected transcripts'), retrieval: t('Searching your recordings'), mistral: t('{provider} is answering', { provider: 'Mistral' }), openai: t('{provider} is answering', { provider: 'OpenAI' }), anthropic: t('{provider} is answering', { provider: 'Anthropic' }), ollama: t('Ollama is answering locally'), lmstudio: t('LM Studio is answering locally'), citations: t('Checking source citations'), saved: t('Saving answer') } as Record<string, string>)[stage] || stage
+ const prompts = () => [
+   { label: t('Summary'), prompt: t('Summarize the selected recordings.'), icon: FileText },
+   { label: t('Action items'), prompt: t('Extract action items and owners from the selected recordings.'), icon: ListChecks },
+@@ -100,8 +100,10 @@ export function AiPage() {
+   }
+   useEffect(() => { if (answers.length || stage) end.current?.scrollIntoView({ block: 'nearest' }) }, [answers, stage])
+   const fresh = () => { request.current++; active.current?.abort(); active.current = null; setStage(''); setOpening(false); setConversationId(crypto.randomUUID()); setAnswers([]); setError(''); setPinned([]); setContextNote(''); setSavedNote(''); setContextError('') }
++  // Consent is for sending transcripts to a cloud provider; a model on this computer (Ollama, LM Studio) needs none.
++  const allowed = consent || Boolean(localTextName(provider))
+   const send = async () => {
+-    if (active.current || opening || loading || !question.trim() || !consent) return
++    if (active.current || opening || loading || !question.trim() || !allowed) return
+     const controller = new AbortController(); active.current = controller; const ticket = ++request.current
+     setError(''); setStage(selected.length ? 'context' : 'retrieval')
+     try {
+@@ -112,6 +114,15 @@ export function AiPage() {
+     } catch (e) { if (ticket === request.current) setError(controller.signal.aborted ? t('Question cancelled. Completed answers remain in history.') : (e as Error).message) }
+     finally { if (ticket === request.current) { active.current = null; setStage('') } }
+   }
++  // A question asked from a recording's preview (?question=) is sent at once when the model runs on this
++  // computer; a cloud provider still waits for the consent box.
++  const autoAsked = useRef(false)
++  useEffect(() => {
++    if (autoAsked.current || loading || !provider || !params.get('question') || !question.trim() || !localTextName(provider)) return
++    autoAsked.current = true
++    void send()
++  // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once, when the page and its settings have loaded
++  }, [loading, provider])
+   const open = async (conversation: AiConversation) => {
+     fresh(); setOpening(true); setQuestion(''); const ticket = ++request.current
+     try {
+@@ -146,7 +157,7 @@ export function AiPage() {
+       ? pinned.length ? t('Allow selected transcript text and pinned recordings to be sent to {provider}.', { provider: provider || t('the configured provider') }) : t('Allow selected transcript text to be sent to {provider}.', { provider: provider || t('the configured provider') })
+       : pinned.length ? t('Allow transcript passages found across your recordings and pinned recordings to be sent to {provider}.', { provider: provider || t('the configured provider') }) : t('Allow transcript passages found across your recordings to be sent to {provider}.', { provider: provider || t('the configured provider') })
+   return <div className={`ai-page ${panelOpen ? 'panel-open' : ''}`}>
+-    <header className="ai-heading"><div><h1>{t('AI Chat')}</h1><span className="capitalize">{provider || t('Provider unavailable')}</span></div><div className="ai-heading-actions"><IconButton label={t('Toggle sources and history')} aria-expanded={panelOpen} aria-controls="ai-context-panel" onClick={() => setPanelOpen(v => !v)}><ListTree /></IconButton><Button variant="outline" size="sm" onClick={() => { fresh(); setQuestion(''); composer.current?.focus() }}><Plus />{t('New conversation')}</Button></div></header>
++    <header className="ai-heading"><div><h1>{t('AI Chat')}</h1><span className="capitalize">{localTextName(provider) ?? (provider || t('Provider unavailable'))}</span></div><div className="ai-heading-actions"><IconButton label={t('Toggle sources and history')} aria-expanded={panelOpen} aria-controls="ai-context-panel" onClick={() => setPanelOpen(v => !v)}><ListTree /></IconButton><Button variant="outline" size="sm" onClick={() => { fresh(); setQuestion(''); composer.current?.focus() }}><Plus />{t('New conversation')}</Button></div></header>
+     <div className="ai-workspace">
+       <aside id="ai-context-panel" className="ai-context" aria-label={t('Recording context')}>
+         <div className="ai-panel-toolbar"><ToggleGroup type="single" value={panel} onValueChange={v => { if (v) setPanel(v) }} aria-label={t('Chat sidebar')}><ToggleGroupItem value="sources"><FileAudio />{t('Sources')}</ToggleGroupItem><ToggleGroupItem value="history"><History />{t('History')}</ToggleGroupItem><ToggleGroupItem value="topics"><Sparkles />{t('Topics')}</ToggleGroupItem></ToggleGroup></div>
+@@ -203,8 +214,8 @@ export function AiPage() {
+         <form className="ai-composer" onSubmit={e => { e.preventDefault(); void send() }}>
+           {error && <p className="device-error" role="alert">{error}</p>}
+           <div className="ai-selected-sources">{selected.slice(0, 3).map(id => <span key={id}><FileAudio /><span>{fileLabel(recordings.find(r => r.recordingId === id)?.filename) || t('Saved recording source')}</span>{!answers.length && !stage && !opening && <IconButton type="button" label={t('Remove source {name}', { name: fileLabel(recordings.find(r => r.recordingId === id)?.filename) || t('recording') })} onClick={() => setSelected(rows => rows.filter(value => value !== id))}><X /></IconButton>}</span>)}{selected.length > 3 && <small>+{selected.length - 3}</small>}{!selected.length && <small>{pinned.length ? t('All recordings + {count} pinned', { count: pinned.length }) : t('All recordings')}</small>}</div>
+-          <div className="ai-input"><textarea ref={composer} aria-label={t('Question about your recordings')} placeholder={t('Ask about your recordings...')} rows={3} maxLength={4000} value={question} disabled={!!stage || opening} onChange={e => setQuestion(e.target.value)} />{stage ? <IconButton type="button" variant="outline" label={t('Cancel question')} onClick={() => active.current?.abort()}><Square /></IconButton> : <IconButton type="submit" variant="default" disabled={!consent || !question.trim() || loading || opening} label={t('Send question')}><ArrowUp /></IconButton>}</div>
+-          <div className="ai-composer-footer"><label className="ai-consent"><input type="checkbox" checked={consent} disabled={!!stage || !provider} onChange={e => setConsent(e.target.checked)} /><span>{consentText}</span></label><span>{question.length}/4000</span></div>
++          <div className="ai-input"><textarea ref={composer} aria-label={t('Question about your recordings')} placeholder={t('Ask about your recordings...')} rows={3} maxLength={4000} value={question} disabled={!!stage || opening} onChange={e => setQuestion(e.target.value)} />{stage ? <IconButton type="button" variant="outline" label={t('Cancel question')} onClick={() => active.current?.abort()}><Square /></IconButton> : <IconButton type="submit" variant="default" disabled={!allowed || !question.trim() || loading || opening} label={t('Send question')}><ArrowUp /></IconButton>}</div>
++          <div className="ai-composer-footer">{localName ? <span className="ai-consent">{t('{name} answers on this computer; nothing is sent elsewhere.', { name: localName })}</span> : <label className="ai-consent"><input type="checkbox" checked={consent} disabled={!!stage || !provider} onChange={e => setConsent(e.target.checked)} /><span>{consentText}</span></label>}<span>{question.length}/4000</span></div>
+         </form>
+       </section>
+     </div>
