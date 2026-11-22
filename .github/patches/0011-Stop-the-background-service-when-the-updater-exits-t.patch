@@ -1,0 +1,124 @@
+From fdd44b7f68000981649e0ab42a9c32032be8aa7e Mon Sep 17 00:00:00 2001
+From: pandapanda57 <343749188+pandapanda57@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 18:52:39 -0800
+Subject: [PATCH] Stop the background service when the updater exits the app,
+ and in the installer before files are replaced
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src-tauri/src/lib.rs                  | 41 ++++++++++++++++++++++-----
+ src-tauri/tauri.conf.json             |  3 ++
+ src-tauri/windows/installer-hooks.nsh | 21 ++++++++++++++
+ 3 files changed, 58 insertions(+), 7 deletions(-)
+ create mode 100644 src-tauri/windows/installer-hooks.nsh
+
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index e97325c..944426b 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -33,7 +33,36 @@ struct RuntimeInfo {
+ }
+ 
+ #[cfg(desktop)]
+-struct SidecarState(Mutex<Option<CommandChild>>);
++type SharedChild = std::sync::Arc<Mutex<Option<CommandChild>>>;
++
++#[cfg(desktop)]
++struct SidecarState(SharedChild);
++
++#[cfg(desktop)]
++fn stop_service(child: &SharedChild) {
++  if let Ok(mut child) = child.lock() {
++    if let Some(child) = child.take() {
++      let _ = child.kill();
++    }
++  }
++}
++
++/// Stops the service when the app's resource table is cleared. The Windows updater calls
++/// `cleanup_before_exit` and then `std::process::exit(0)`, so `RunEvent::Exit` never fires
++/// on that path; without this the old service keeps running and the installer cannot
++/// replace `openplod-server.exe`.
++#[cfg(desktop)]
++struct ServiceGuard(SharedChild);
++
++#[cfg(desktop)]
++impl tauri::Resource for ServiceGuard {}
++
++#[cfg(desktop)]
++impl Drop for ServiceGuard {
++  fn drop(&mut self) {
++    stop_service(&self.0);
++  }
++}
+ 
+ #[tauri::command]
+ fn runtime_info(info: tauri::State<'_, RuntimeInfo>) -> RuntimeInfo {
+@@ -153,7 +182,9 @@ fn start_service(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+     while events.recv().await.is_some() {}
+   });
+ 
+-  app.manage(SidecarState(Mutex::new(Some(child))));
++  let child: SharedChild = std::sync::Arc::new(Mutex::new(Some(child)));
++  app.resources_table().add(ServiceGuard(child.clone()));
++  app.manage(SidecarState(child));
+   app.manage(RuntimeInfo {
+     mode: "desktop",
+     service_origin: Some(format!("http://127.0.0.1:{SERVICE_PORT}")),
+@@ -207,11 +238,7 @@ pub fn run() {
+       #[cfg(desktop)]
+       if matches!(_event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
+         if let Some(state) = _app_handle.try_state::<SidecarState>() {
+-          if let Ok(mut child) = state.0.lock() {
+-            if let Some(child) = child.take() {
+-              let _ = child.kill();
+-            }
+-          }
++          stop_service(&state.0);
+         }
+       }
+     });
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index 2dbb039..0f1b7fb 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -47,6 +47,9 @@
+     "android": {
+       "debugApplicationIdSuffix": ".debug"
+     },
++    "windows": {
++      "nsis": { "installerHooks": "windows/installer-hooks.nsh" }
++    },
+     "linux": {
+       "deb": { "depends": ["libdbus-1-3", "bluez", "ffmpeg"] },
+       "rpm": { "depends": ["dbus-libs", "bluez", "ffmpeg"] }
+diff --git a/src-tauri/windows/installer-hooks.nsh b/src-tauri/windows/installer-hooks.nsh
+new file mode 100644
+index 0000000..07211d9
+--- /dev/null
++++ b/src-tauri/windows/installer-hooks.nsh
+@@ -0,0 +1,21 @@
++; OpenPlod installer hooks (Tauri NSIS).
++; The installer closes the OpenPlod window itself, but not its background service or the
++; Bluetooth helper. A service left running (after a crash, or an update started by an older
++; build) locks openplod-server.exe and the install stops with "Error opening file for writing".
++; Stop both before files are copied or removed. taskkill only reaches this user's processes.
++
++!macro OPENPLOD_STOP_SERVICE
++  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /T /IM openplod-server.exe'
++  Pop $0
++  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM plaud-bridge.exe'
++  Pop $0
++  Sleep 1000
++!macroend
++
++!macro NSIS_HOOK_PREINSTALL
++  !insertmacro OPENPLOD_STOP_SERVICE
++!macroend
++
++!macro NSIS_HOOK_PREUNINSTALL
++  !insertmacro OPENPLOD_STOP_SERVICE
++!macroend
+-- 
+2.54.0.windows.1
+
