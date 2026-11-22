@@ -1,0 +1,191 @@
+Subject: [PATCH] Local pipeline: find the Python in the profile folder, show the real app version
+
+The pipeline Python is now looked for in %USERPROFILE%\plaud-asr\.venv before
+%LOCALAPPDATA%\plaud-asr\.venv: a venv made from a Store (MSIX) app such as the Claude desktop app
+under AppData lands in that app's private folder and OpenPlod cannot see it. The install hint
+and docs/local-pipeline.md explain this. The desktop app now passes its own version to the
+service (OPENPLOD_APP_VERSION), used in /api/info and in each export's openplod.json.
+---
+diff --git a/docs/local-pipeline.md b/docs/local-pipeline.md
+index cb24b42..4dc9bcb 100644
+--- a/docs/local-pipeline.md
++++ b/docs/local-pipeline.md
+@@ -39,15 +39,22 @@ A run is stopped after 3× the audio length plus 15 minutes. **Cancel** stops th
+ 
+ ## Install (once per computer, Windows)
+ 
+-1. **Python with faster-whisper.** The default location is `%LOCALAPPDATA%\plaud-asr\.venv`:
++1. **Python with faster-whisper.** OpenPlod looks in `%USERPROFILE%\plaud-asr\.venv` first, then
++   `%LOCALAPPDATA%\plaud-asr\.venv`:
+    ```powershell
+-   py -3.12 -m venv "$env:LOCALAPPDATA\plaud-asr\.venv"
+-   & "$env:LOCALAPPDATA\plaud-asr\.venv\Scripts\python.exe" -m pip install faster-whisper==1.2.1 soundfile
++   py -3.12 -m venv "$env:USERPROFILE\plaud-asr\.venv"
++   & "$env:USERPROFILE\plaud-asr\.venv\Scripts\python.exe" -m pip install faster-whisper==1.2.1 soundfile
+    ```
+    Then download the model once, while online, so it is in the Hugging Face cache:
+    ```powershell
+-   & "$env:LOCALAPPDATA\plaud-asr\.venv\Scripts\python.exe" -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')"
++   & "$env:USERPROFILE\plaud-asr\.venv\Scripts\python.exe" -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')"
+    ```
++   **Create it from an ordinary terminal, not from inside a Microsoft Store (MSIX) app** such as the Claude
++   desktop app. Windows redirects what such an app writes under `AppData` into its own private folder
++   (`%LOCALAPPDATA%\Packages\<app>\LocalCache\...`), where OpenPlod cannot see it. That includes uv's default
++   Python folder, `%APPDATA%\uv\python`. If the venv is already there, copy the venv and the Python it was made
++   from to `%USERPROFILE%\plaud-asr\.venv` and `%USERPROFILE%\plaud-asr\python`, then change the `home =` line in
++   `.venv\pyvenv.cfg` to the new Python folder.
+ 2. **NeMo-Speech.cpp 0.3.0.** Download `nemo-speech-0.3.0-windows-x86_64-vulkan.zip` (GPU) and
+    `nemo-speech-0.3.0-windows-x86_64-cpu.zip` from
+    <https://github.com/NVIDIA/NeMo-Speech.cpp/releases/tag/v0.3.0>. Check each against that release's
+@@ -68,7 +75,7 @@ computer can change these fields: a paired phone or an `OPENPLOD_API_TOKEN` scri
+ 
+ | Field | Empty means (in this order) |
+ | --- | --- |
+-| Pipeline Python | env `PIPELINE_PYTHON`, then `%LOCALAPPDATA%\plaud-asr\.venv\Scripts\python.exe` |
++| Pipeline Python | env `PIPELINE_PYTHON`, then the first that exists of `%USERPROFILE%\plaud-asr\.venv\Scripts\python.exe` and `%LOCALAPPDATA%\plaud-asr\.venv\Scripts\python.exe` |
+ | nemo-speech.exe | env `NEMO_SPEECH_EXE`, then `%LOCALAPPDATA%\nemo-speech\*vulkan*\…\bin\nemo-speech.exe` (newest first), then `*cpu*` |
+ | Work folder | env `PIPELINE_WORK_DIR`, then `%LOCALAPPDATA%\OpenPlodPipeline` |
+ | Export (checkbox) | on |
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 944426b..448428c 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -142,7 +142,9 @@ fn start_service(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+     .env("PORT", SERVICE_PORT.to_string())
+     .env("DATABASE_URL", app_data_dir.join("openplod.db"))
+     .env("OPENPLOD_LIBRARY_PATH", library_dir)
+-    .env("OPENPLOD_PAIRING_TOKEN", &pairing_token);
++    .env("OPENPLOD_PAIRING_TOKEN", &pairing_token)
++    // The installed version (package.json keeps the upstream number in patched builds).
++    .env("OPENPLOD_APP_VERSION", app.package_info().version.to_string());
+   // Every desktop platform speaks Bluetooth through the same bundled
+   // `plaud-bridge` binary (CoreBluetooth, BlueZ or WinRT under one protocol).
+   let command = match ble_bridge_path() {
+diff --git a/src/ai/config.ts b/src/ai/config.ts
+index 1f12f50..f0055ea 100644
+--- a/src/ai/config.ts
++++ b/src/ai/config.ts
+@@ -57,7 +57,7 @@ export const aiConfigSchema = z.object({
+   confirmAboveUsd: usd,
+   /** Split audio longer than this many minutes into chunks (0: only when a provider's size limit requires it). */
+   transcriptionChunkAboveMinutes: z.number().int().min(0).max(1440).default(0),
+-  /** Local pipeline: Python with faster-whisper ('' = %LOCALAPPDATA%\plaud-asr\.venv, or env PIPELINE_PYTHON). */
++  /** Local pipeline: Python with faster-whisper ('' = env PIPELINE_PYTHON, then %USERPROFILE%\plaud-asr\.venv, then %LOCALAPPDATA%\plaud-asr\.venv). */
+   pipelinePython: localPath,
+   /** Local pipeline: nemo-speech.exe ('' = env NEMO_SPEECH_EXE, then the newest Vulkan build, then CPU). */
+   pipelineNemoExe: localPath,
+diff --git a/src/index.ts b/src/index.ts
+index 30e8aea..81603fa 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -50,6 +50,9 @@ import { assemblyAiCancelHook } from './transcription/remote-cancel';
+ import { decodedOriginal, exportRoot, meetingFolderName, pipelineSettingsOf, recordingStart, writePipelineExport } from './transcription/pipeline-export';
+ import packageInfo from '../package.json';
+ 
++/** The installed app's version (set by the desktop app); package.json's when run from source. */
++const appVersion = /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(process.env.OPENPLOD_APP_VERSION ?? '') ? process.env.OPENPLOD_APP_VERSION! : packageInfo.version;
++
+ // ============================================
+ // Create tables on startup
+ // ============================================
+@@ -127,7 +130,7 @@ jobQueue.register('process-recording', async (data: any, job) => {
+     if (result.engine === 'local-pipeline' && pipeline?.workDir && currentConfig.transcriptExport) {
+       if (!pipeline.diarized) console.log(`[Export] Skipped for ${recordingId}: speaker labels were off, so diar.json was not written.`);
+       else try {
+-        const folder = await writePipelineExport({ root: exportRoot(currentConfig), name: meetingName, workDir: pipeline.workDir, appVersion: packageInfo.version, start,
++        const folder = await writePipelineExport({ root: exportRoot(currentConfig), name: meetingName, workDir: pipeline.workDir, appVersion, start,
+           recording: { id: recording.id, sourceRecordingId: recording.sourceRecordingId ?? null, recordedAt: recording.recordedAt ?? null, uploadedAt: recording.uploadedAt ?? null, durationSeconds: Math.round(result.duration) || recording.durationSeconds || null, filePath: recording.filePath } });
+         console.log(`[Export] ${recordingId} -> ${folder}`);
+       } catch (error) { console.error(`[Export] Failed for ${recordingId}:`, error instanceof Error ? error.message : error); }
+@@ -200,7 +203,7 @@ app.use('/api/*', apiAccess);
+ app.get('/health', (c) => c.json({ status: 'ok', jobs: jobQueue.getStats() }));
+ app.get('/api/info', (c) => c.json({
+   name: 'OpenPlod',
+-  version: packageInfo.version,
++  version: appVersion,
+   status: 'ok',
+   engines: currentEngineStatus(),
+ }));
+diff --git a/src/transcription/local-pipeline.test.ts b/src/transcription/local-pipeline.test.ts
+index c2338e2..9cd3474 100644
+--- a/src/transcription/local-pipeline.test.ts
++++ b/src/transcription/local-pipeline.test.ts
+@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
+ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+ import { join } from 'node:path';
+ import { tmpdir } from 'node:os';
+-import { nemoCandidates, percentDone, pipelinePrompt, progressLine, LocalPipelineEngine } from './local-pipeline';
++import { nemoCandidates, percentDone, pipelinePrompt, pipelinePython, progressLine, pythonCandidates, LocalPipelineEngine } from './local-pipeline';
+ import { speechCapabilities } from '../ai/capabilities';
+ import { aiConfigFromSettings, aiConfigSchema, isLocalProvider } from '../ai/config';
+ import { estimateSpeechUsd } from '../ai/pricing';
+@@ -46,6 +46,24 @@ test('nemo-speech builds: setting first, then Vulkan before CPU, newest version
+   } finally { if (saved !== undefined) process.env.NEMO_SPEECH_EXE = saved; }
+ });
+ 
++test('pipeline Python: the setting, then the profile folder, then AppData; the first existing one wins', () => {
++  const home = temp(), local = temp(), python = (root: string) => join(root, 'plaud-asr', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
++  const make = (path: string) => { mkdirSync(join(path, '..'), { recursive: true }); writeFileSync(path, ''); };
++  const saved = process.env.PIPELINE_PYTHON; delete process.env.PIPELINE_PYTHON;
++  try {
++    const candidates = pythonCandidates(home, local);
++    expect(candidates).toEqual([python(home), python(local)]);
++    expect(pipelinePython({}, candidates)).toBe(python(home)); // nothing exists: report the first place to put it
++    make(python(local)); expect(pipelinePython({}, candidates)).toBe(python(local));
++    make(python(home)); expect(pipelinePython({}, candidates)).toBe(python(home));
++    expect(pipelinePython({ python: 'C:\\chosen\\python.exe' }, candidates)).toBe('C:\\chosen\\python.exe');
++  } finally { if (saved !== undefined) process.env.PIPELINE_PYTHON = saved; }
++});
++
++test('the install hint explains venvs hidden inside a Store app', () => {
++  expect(new LocalPipelineEngine({ python: join(temp(), 'missing.exe') }).installHint()).toContain('Claude desktop app');
++});
++
+ test('progress: step lines, audio length, and percent from the segment end time', () => {
+   const state = { step: 0, audioSec: null as number | null };
+   expect(progressLine('STEP 1 asr', state)).toBe(true);
+diff --git a/src/transcription/local-pipeline.ts b/src/transcription/local-pipeline.ts
+index 6737af0..d5e3b87 100644
+--- a/src/transcription/local-pipeline.ts
++++ b/src/transcription/local-pipeline.ts
+@@ -17,7 +17,7 @@ import script from './local-pipeline.py' with { type: 'text' };
+  * that is not already cached fails with a clear message instead of downloading.
+  *
+  * Paths come from Settings (AI providers -> Local pipeline), then environment variables, then defaults:
+- *   Python       pipelinePython     | PIPELINE_PYTHON   | %LOCALAPPDATA%\plaud-asr\.venv\Scripts\python.exe
++ *   Python       pipelinePython     | PIPELINE_PYTHON   | %USERPROFILE%\plaud-asr\.venv, then %LOCALAPPDATA%\plaud-asr\.venv
+  *   nemo-speech  pipelineNemoExe    | NEMO_SPEECH_EXE   | %LOCALAPPDATA%\nemo-speech\*vulkan*\*\bin, then *cpu*
+  *   work folder  pipelineWorkFolder | PIPELINE_WORK_DIR | %LOCALAPPDATA%\OpenPlodPipeline
+  */
+@@ -27,8 +27,20 @@ const windows = process.platform === 'win32';
+ const exeName = windows ? 'nemo-speech.exe' : 'nemo-speech';
+ export const localAppData = () => process.env.LOCALAPPDATA || (windows ? join(homedir(), 'AppData', 'Local') : join(homedir(), '.local', 'share'));
+ 
+-export function pipelinePython(settings: PipelineSettings = {}): string {
+-  return settings.python || process.env.PIPELINE_PYTHON || join(localAppData(), 'plaud-asr', '.venv', windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python');
++const venvPython = (root: string) => join(root, 'plaud-asr', '.venv', windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python');
++/**
++ * Where to look for the pipeline Python when the setting and PIPELINE_PYTHON are empty:
++ * %USERPROFILE%\plaud-asr\.venv first, then %LOCALAPPDATA%\plaud-asr\.venv.
++ * The profile folder comes first because a venv created from a packaged (MSIX) app such as the Claude desktop
++ * app under AppData is redirected into that app's private folder and is invisible to OpenPlod.
++ */
++export function pythonCandidates(home = homedir(), local = localAppData()): string[] {
++  return [...new Set([venvPython(home), venvPython(local)])];
++}
++export function pipelinePython(settings: PipelineSettings = {}, candidates = pythonCandidates()): string {
++  if (settings.python) return settings.python;
++  if (process.env.PIPELINE_PYTHON) return process.env.PIPELINE_PYTHON;
++  return candidates.find(path => existsSync(path)) ?? candidates[0];
+ }
+ export function pipelineWorkRoot(settings: PipelineSettings = {}): string {
+   return settings.workFolder || process.env.PIPELINE_WORK_DIR || join(localAppData(), 'OpenPlodPipeline');
+@@ -92,7 +104,7 @@ export class LocalPipelineEngine implements TranscriptionEngine {
+   /** Why the engine is unavailable, for error messages. */
+   installHint(): string {
+     const python = pipelinePython(this.settings);
+-    if (!existsSync(python)) return `Pipeline Python not found at ${python}. Install faster-whisper in that venv or set its path in AI settings (Local pipeline). See the README.`;
++    if (!existsSync(python)) return `Pipeline Python not found at ${python}. Create a venv with faster-whisper in %USERPROFILE%\\plaud-asr\\.venv, or set its path in AI settings (Local pipeline). A venv made from the Claude desktop app (or another Store app) under AppData is only visible to that app: copy it out. See docs/local-pipeline.md.`;
+     return 'NeMo-Speech.cpp (nemo-speech.exe) not found. Unzip it under %LOCALAPPDATA%\\nemo-speech or set its path in AI settings (Local pipeline). See the README.';
+   }
+ 
