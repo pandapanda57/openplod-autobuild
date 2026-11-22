@@ -1,0 +1,712 @@
+Subject: [PATCH] Settings in sections, saving as you change things
+
+Settings shows one section at a time from a list on the left (General, Recording & import,
+Transcription, AI models, Storage & backup, Advanced), with ?section= links; older #profiles,
+#backup and #pairing links open the matching section. Every setting saves on its own shortly after
+a change, so the Save, Save AI and Save search settings buttons are gone; a status line says Saving,
+Saved or Not saved. AI settings appear with the section they belong to (transcription engine and
+local pipeline under Transcription, text models, LM Studio and spending under AI models, processing
+jobs under Advanced), and API keys with the part that uses them. Auto-transcribe and Auto-summarize
+live in Settings only; the Plaud Device page shows their state and links there. General shows the
+installed app version. Mobile pairing is on the Android page only.
+---
+diff --git a/web/src/components/AiSettingsPanel.tsx b/web/src/components/AiSettingsPanel.tsx
+index fcff69e..5f68e1f 100644
+--- a/web/src/components/AiSettingsPanel.tsx
++++ b/web/src/components/AiSettingsPanel.tsx
+@@ -4,9 +4,10 @@ import { PROMPT_LIMIT, configOf, customEndpointIsLocal, formatUsd, jobStatusLabe
+ import { t, tn } from '@/i18n'
+ import { PROFILES_CHANGED } from '@/components/TranscriptionProfilesPanel'
+ import { useActivity } from '@/lib/activity'
++import { invalidateTextAi } from '@/lib/text-ai'
+ import { Input } from '@/components/ui/input'
+ import { Button } from '@/components/ui/button'
+-import { Save, RefreshCw, X, Loader2 } from '@/components/icons'
++import { RefreshCw, X } from '@/components/icons'
+ 
+ const speech: SpeechProvider[] = ['local-pipeline', 'whisper', 'mistral', 'deepgram', 'openai', 'assemblyai']
+ const text: TextProvider[] = ['lmstudio', 'ollama', 'mistral', 'openai', 'anthropic', 'gemini', 'custom']
+@@ -17,11 +18,20 @@ const providerName = (provider: string) => provider === 'custom' ? t('Custom end
+ const tasks = ['analysis', 'document', 'chat'] as const
+ const selectClass = 'h-10 w-full min-w-0 rounded-md border bg-background px-3 text-sm'
+ const usdValue = (value: string) => value.trim() === '' ? null : Math.max(0, Number(value))
+-export function AiSettingsPanel() {
++export type AiSettingsPart = 'all' | 'transcription' | 'models' | 'advanced'
++/**
++ * AI settings, shown whole or by part (Settings shows one part per section). Changes save on their
++ * own shortly after the last edit; only one part is on screen at a time, so parts never overwrite
++ * each other's unsaved changes.
++ */
++export function AiSettingsPanel({ part = 'all' }: { part?: AiSettingsPart }) {
++  const show = (name: Exclude<AiSettingsPart, 'all'>) => part === 'all' || part === name
+   const [settings, setSettings] = useState<AiSettings | null>(null)
+   const [keys, setKeys] = useState<Record<string, string>>({})
+   const [vocabulary, setVocabulary] = useState('')
+   const [error, setError] = useState(''), [notice, setNotice] = useState(''), [busy, setBusy] = useState(false)
++  // Autosave: every edit bumps `edits`; a save runs 800 ms after the last one.
++  const [edits, setEdits] = useState(0), [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+   const [models, setModels] = useState<string[]>([]), [jobs, setJobs] = useState<ProcessingJob[]>([])
+   // While the job list is open it follows the shared activity poller instead of waiting for Refresh.
+   const { jobs: liveJobs } = useActivity(), [jobsOpen, setJobsOpen] = useState(false)
+@@ -43,14 +53,28 @@ export function AiSettingsPanel() {
+     load(); window.addEventListener(PROFILES_CHANGED, load)
+     return () => window.removeEventListener(PROFILES_CHANGED, load)
+   }, [])
+-  const update = (patch: Partial<AiConfig>) => { setNotice(''); if (patch.transcriptionVocabulary) setVocabulary(patch.transcriptionVocabulary.join(', ')); setSettings(value => value ? { ...value, ...patch } : value) }
++  const update = (patch: Partial<AiConfig>) => { setNotice(''); if (patch.transcriptionVocabulary) setVocabulary(patch.transcriptionVocabulary.join(', ')); setSettings(value => value ? { ...value, ...patch } : value); setEdits(value => value + 1) }
+   const action = async (run: () => Promise<void>) => { setBusy(true); setError(''); setNotice(''); try { await run() } catch (e) { setError(e instanceof Error ? e.message : t('AI settings unavailable.')) } finally { setBusy(false) } }
+-  const save = () => action(async () => {
+-    if (!settings) return
+-    const config = configOf(settings)
+-    config.transcriptionVocabulary = vocabulary.split(',').map(value => value.trim()).filter(Boolean)
+-    await aiSettingsApi.save(config, keys); setKeys({}); setSettings(await aiSettingsApi.get()); setSpend(await aiSettingsApi.spending().catch(() => null)); setNotice(t('AI settings saved'))
+-  })
++  useEffect(() => {
++    if (!edits || !settings) return
++    const timer = window.setTimeout(async () => {
++      const config = configOf(settings), sent = { ...keys }
++      config.transcriptionVocabulary = vocabulary.split(',').map(value => value.trim()).filter(Boolean)
++      setSaveState('saving')
++      try {
++        await aiSettingsApi.save(config, sent)
++        // Only the server-computed fields are refreshed, so nothing typed meanwhile is replaced.
++        const fresh = await aiSettingsApi.get()
++        setSettings(value => value ? { ...value, credentials: fresh.credentials, textCapabilities: fresh.textCapabilities, pipelineResolved: fresh.pipelineResolved } : fresh)
++        setKeys(value => Object.fromEntries(Object.entries(value).filter(([name, key]) => sent[name] !== key)))
++        setSpend(await aiSettingsApi.spending().catch(() => null))
++        setError(''); setSaveState('saved')
++        invalidateTextAi()
++      } catch (e) { setSaveState('error'); setError(e instanceof Error ? e.message : t('AI settings unavailable.')) }
++    }, 800)
++    return () => window.clearTimeout(timer)
++  // eslint-disable-next-line react-hooks/exhaustive-deps -- saves the state as of the latest edit only
++  }, [edits])
+   // Context windows of the selected local models, so long transcripts are refused up front rather than truncated.
+   const loadModels = () => action(async () => {
+     const installed = await aiSettingsApi.models(); setModels(installed)
+@@ -71,33 +95,36 @@ export function AiSettingsPanel() {
+   const allOnLmStudio = tasks.every(task => settings[`${task}Provider`] === 'lmstudio' && settings[`${task}Model`])
+   const useLmStudio = () => update(Object.fromEntries(tasks.flatMap(task => [[`${task}Provider`, 'lmstudio'], [`${task}Model`, lmDefault], [`${task}Fallback`, []]])) as Partial<AiConfig>)
+   const localSpeech = (provider: SpeechProvider) => settings.capabilities[provider].local
++  // Keys shown with each part: speech keys under Transcription, text keys under AI models.
++  const speechUsed = new Set<string>([settings.transcriptionEngine, ...settings.transcriptionFallback])
++  const partUsed = used.filter(provider => part === 'all' || (part === 'transcription' ? speechUsed.has(provider) : part === 'models' ? textUsed.includes(provider as TextProvider) : false))
+   const resolved = settings.pipelineResolved
+   const languages = languagesFor(settings, settings.transcriptionEngine, settings.transcriptionModel)
+   const languageOptions = languages.some(([code]) => code === settings.transcriptionLanguage) ? languages : [...languages, [settings.transcriptionLanguage, t('{language} (not documented for this model)', { language: languageLabel(settings.transcriptionLanguage) })] as [string, string]]
+   return <section className="border-t pt-5 space-y-5" aria-label={t('AI providers')}>
+-    <div className="flex items-center justify-between gap-3"><h2 className="text-base font-semibold">{t('AI providers')}</h2><Button disabled={busy} onClick={save}>{busy ? <Loader2 className="animate-spin" /> : <Save />}{t('Save AI')}</Button></div>
++    <div className="flex items-center justify-between gap-3">{part === 'all' ? <h2 className="text-base font-semibold">{t('AI providers')}</h2> : <span />}<span className="text-xs text-muted-foreground" role="status">{saveState === 'saving' ? t('Saving...') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Not saved') : t('Changes save automatically')}</span></div>
+     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}{notice && <p role="status" className="text-sm">{notice}</p>}
+-    <label className="grid gap-2 text-sm">{t('Processing privacy')}<select className={selectClass} disabled={busy} value={settings.privacyMode} onChange={e => { const localText = lmIds.length ? 'lmstudio' as const : 'ollama' as const, localModel = lmIds.length ? lmDefault : ''; update(e.target.value === 'local-only' ? { privacyMode: 'local-only', transcriptionEngine: 'local-pipeline', transcriptionModel: '', transcriptionDiarize: true, transcriptionVocabulary: [], transcriptionFallback: [], analysisProvider: localText, analysisModel: localModel, documentProvider: localText, documentModel: localModel, chatProvider: localText, chatModel: localModel, analysisFallback: [], documentFallback: [], chatFallback: [] } : { privacyMode: 'selected-providers' }) }}><option value="selected-providers">{t('Selected providers')}</option><option value="local-only">{t('Local only')}</option></select></label>
+-    <fieldset disabled={busy} className="grid min-w-0 gap-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Transcription')}</legend>
++    {(show('transcription') || show('models')) && <label className="grid gap-2 text-sm">{t('Processing privacy')}<select className={selectClass} disabled={busy} value={settings.privacyMode} onChange={e => { const localText = lmIds.length ? 'lmstudio' as const : 'ollama' as const, localModel = lmIds.length ? lmDefault : ''; update(e.target.value === 'local-only' ? { privacyMode: 'local-only', transcriptionEngine: 'local-pipeline', transcriptionModel: '', transcriptionDiarize: true, transcriptionVocabulary: [], transcriptionFallback: [], analysisProvider: localText, analysisModel: localModel, documentProvider: localText, documentModel: localModel, chatProvider: localText, chatModel: localModel, analysisFallback: [], documentFallback: [], chatFallback: [] } : { privacyMode: 'selected-providers' }) }}><option value="selected-providers">{t('Selected providers')}</option><option value="local-only">{t('Local only')}</option></select></label>}
++    {show('transcription') && <fieldset disabled={busy} className="grid min-w-0 gap-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Transcription')}</legend>
+       <label className="grid gap-2 text-sm">{t('Provider')}<select className={selectClass} value={settings.transcriptionEngine} onChange={e => update({ transcriptionEngine: e.target.value as SpeechProvider, transcriptionModel: '', transcriptionDiarize: e.target.value === 'local-pipeline', transcriptionVocabulary: [], transcriptionFallback: [], ...(settings.capabilities[e.target.value as SpeechProvider].prompt ? {} : { transcriptionPrompt: '' }) })}>{speech.map(provider => <option key={provider} disabled={local && !localSpeech(provider)} value={provider}>{labels[provider]}</option>)}</select></label>
+       <label className="grid gap-2 text-sm">{t('Model')}<select className={selectClass} value={settings.transcriptionModel} onChange={e => update({ transcriptionModel: e.target.value })}><option value="">{t('{model} (default)', { model: capability.models[0] })}</option>{capability.models.map(model => <option key={model}>{model}</option>)}</select></label>
+       <label className="grid gap-2 text-sm">{t('Language')}<select className={selectClass} value={settings.transcriptionLanguage} onChange={e => update({ transcriptionLanguage: e.target.value })}>{languageOptions.map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
+       <label className="flex items-center gap-2 text-sm"><input type="checkbox" disabled={!capability.diarization} checked={settings.transcriptionDiarize} onChange={e => update({ transcriptionDiarize: e.target.checked })} />{t('Speaker labels')}</label>
+-      <label className="grid gap-2 text-sm sm:col-span-2">{t('Vocabulary hints')}<Input disabled={!capability.vocabulary} value={vocabulary} onChange={e => { setVocabulary(e.target.value); setNotice('') }} /></label>
++      <label className="grid gap-2 text-sm sm:col-span-2">{t('Vocabulary hints')}<Input disabled={!capability.vocabulary} value={vocabulary} onChange={e => { setVocabulary(e.target.value); setNotice(''); setEdits(value => value + 1) }} /></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Default profile')}<select className={selectClass} value={settings.transcriptionProfile} onChange={e => update({ transcriptionProfile: e.target.value })}><option value="">{t('None')}</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}{settings.transcriptionProfile && !profiles.some(profile => profile.id === settings.transcriptionProfile) && <option value={settings.transcriptionProfile}>{t('Missing profile')}</option>}</select></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Context prompt')}<textarea className="min-h-20 w-full rounded-md border bg-background px-3 py-2 text-sm" disabled={!capability.prompt} maxLength={PROMPT_LIMIT} rows={3} value={capability.prompt ? settings.transcriptionPrompt : ''} placeholder={capability.prompt ? t('Describe your usual recordings: who speaks, the topic, names to spell.') : t('{provider} does not accept a context prompt.', { provider: capability.label })} onChange={e => update({ transcriptionPrompt: e.target.value })} /></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Fallback provider')}<select className={selectClass} value={settings.transcriptionFallback[0] || ''} onChange={e => update({ transcriptionFallback: e.target.value ? [e.target.value as SpeechProvider] : [] })}><option value="">{t('None')}</option>{speech.filter(provider => provider !== settings.transcriptionEngine).map(provider => <option key={provider} disabled={local && !localSpeech(provider)} value={provider}>{labels[provider]}</option>)}</select></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Split recordings longer than (minutes, 0 = only when a provider size limit requires it)')}<Input type="number" min={0} max={1440} step={1} value={settings.transcriptionChunkAboveMinutes} onChange={e => update({ transcriptionChunkAboveMinutes: Math.max(0, Math.min(1440, Math.round(Number(e.target.value) || 0))) })} /></label>
+-    </fieldset>
+-    <fieldset disabled={busy} className="grid min-w-0 gap-4 border-t pt-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Local pipeline')}</legend>
++    </fieldset>}
++    {show('transcription') && <fieldset disabled={busy} className="grid min-w-0 gap-4 border-t pt-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Local pipeline')}</legend>
+       <p className="text-xs text-muted-foreground sm:col-span-2">{t('faster-whisper speech to text with Nemotron-3 speaker labels, run on this computer at below-normal priority. Leave a field empty to use the default shown. Only the desktop app can change these paths.')}</p>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Pipeline Python (venv with faster-whisper)')}<Input value={settings.pipelinePython} placeholder={resolved.python} onChange={e => update({ pipelinePython: e.target.value })} /><span className="text-xs text-muted-foreground">{resolved.pythonFound ? t('Found.') : t('Not found at {path}.', { path: resolved.python })}</span></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('nemo-speech.exe (speaker labels)')}<Input value={settings.pipelineNemoExe} placeholder={resolved.nemo[0] ?? t('Detect automatically: Vulkan build first, then CPU')} onChange={e => update({ pipelineNemoExe: e.target.value })} /><span className="text-xs text-muted-foreground">{resolved.nemo.length ? tn(resolved.nemo.length, '{count} build found; the next one is tried if one fails.', '{count} builds found; the next one is tried if one fails.') : t('No nemo-speech build found.')}</span></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Work folder')}<Input value={settings.pipelineWorkFolder} placeholder={resolved.workFolder} onChange={e => update({ pipelineWorkFolder: e.target.value })} /></label>
+       <label className="flex items-center gap-2 text-sm sm:col-span-2"><input type="checkbox" checked={settings.transcriptExport} onChange={e => update({ transcriptExport: e.target.checked })} />{t('After each local-pipeline transcript, copy its files to the export folder')}</label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Export folder')}<Input disabled={!settings.transcriptExport} value={settings.transcriptExportFolder} placeholder={resolved.exportFolder} onChange={e => update({ transcriptExportFolder: e.target.value })} /><span className="text-xs text-muted-foreground">{t('One folder per recording, named YYYY-MM-DD_HHMM_meeting from its start time. Needs speaker labels on.')}</span></label>
+-    </fieldset>
+-    <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Text AI')}</legend>{tasks.map(task => {
++    </fieldset>}
++    {show('models') && <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Text AI')}</legend>{tasks.map(task => {
+       const provider = settings[`${task}Provider`], model = settings[`${task}Model`], fallback = settings[`${task}Fallback`][0]?.provider ?? ''
+       return <div key={task} className="grid gap-3 sm:grid-cols-3">
+         <label className="grid gap-2 text-sm">{task === 'analysis' ? t('Summaries') : task === 'document' ? t('Documents') : t('Chat')}<select className={selectClass} value={provider} onChange={e => update({ [`${task}Provider`]: e.target.value, [`${task}Model`]: '', [`${task}Fallback`]: [] })}>{text.map(item => <option key={item} value={item} disabled={local && !isLocalText(item)}>{providerName(item)}</option>)}</select></label>
+@@ -117,13 +144,13 @@ export function AiSettingsPanel() {
+       <span className="text-xs text-muted-foreground">{t('Runs on this computer, no API key. Open LM Studio yourself and turn on its local server; OpenPlod never starts it. A model loads on first use, so the first answer can take longer.')}</span>
+       {tasks.some(task => settings[`${task}Provider`] === 'lmstudio') && (() => { const chosen = (lmModels ?? []).find(item => item.id === lmDefault); return chosen?.maxContext ? <span className="text-xs text-muted-foreground">{t('{model} handles up to {tokens} tokens; LM Studio loads it with the context length set in LM Studio. A transcript longer than the loaded context is refused, never cut or sent to a cloud provider.', { model: chosen.id, tokens: chosen.maxContext })}</span> : null })()}
+       {lmIds.length > 0 && !allOnLmStudio && <Button type="button" size="sm" className="justify-self-start" onClick={useLmStudio}>{t('Use LM Studio for summaries, documents and chat')}</Button>}
+-    </div></fieldset>
+-    <fieldset disabled={busy} className="grid min-w-0 gap-4 border-t pt-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Cloud spending')}</legend>
++    </div></fieldset>}
++    {show('models') && <fieldset disabled={busy} className="grid min-w-0 gap-4 border-t pt-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Cloud spending')}</legend>
+       <label className="grid gap-2 text-sm">{t('Monthly budget (USD)')}<Input type="number" min={0} step="0.01" value={settings.monthlyBudgetUsd ?? ''} placeholder={t('No budget')} onChange={e => update({ monthlyBudgetUsd: usdValue(e.target.value) })} /></label>
+       <label className="grid gap-2 text-sm">{t('Ask before a job over (USD)')}<Input type="number" min={0} step="0.01" value={settings.confirmAboveUsd ?? ''} placeholder={t('Never ask')} onChange={e => update({ confirmAboveUsd: usdValue(e.target.value) })} /></label>
+       <p className="text-xs text-muted-foreground sm:col-span-2">{spend ? `${t('Estimated this month ({month}, UTC): {amount}', { month: spend.month, amount: formatUsd(spend.estimatedUsd) })}${spend.unknownEntries ? tn(spend.unknownEntries, ', plus {count} job with unknown cost', ', plus {count} jobs with unknown cost') : ''}${spend.budgetUsd !== null ? t('; {remaining} of {budget} left', { remaining: formatUsd(spend.remainingUsd), budget: formatUsd(spend.budgetUsd) }) : ''}. ` : ''}{settings.pricing.label} {t('Prices as of {date}. Jobs over the budget or threshold need your confirmation; providers do not enforce this limit.', { date: settings.pricing.pricesAsOf })}</p>
+-    </fieldset>
+-    {used.length > 0 && <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Credentials')}</legend>{used.map(provider => <div key={provider} className="flex items-end gap-2"><label className="grid flex-1 gap-2 text-sm">{provider === 'custom' ? t('{provider} API key (optional)', { provider: providerName(provider) }) : t('{provider} API key', { provider: labels[provider] })}<Input type="password" autoComplete="off" value={keys[`${provider}ApiKey`] || ''} placeholder={settings.credentials[`${provider}ApiKey`] ? t('Saved key') : t('Not configured')} onChange={e => setKeys(value => ({ ...value, [`${provider}ApiKey`]: e.target.value }))} /></label><Button variant="outline" disabled={Object.keys(keys).length > 0} onClick={() => action(async () => { await aiSettingsApi.check(provider); setNotice(t('{provider} connection verified', { provider: providerName(provider) })) })}>{t('Check')}</Button></div>)}</fieldset>}
+-    <details className="border-t pt-4" onToggle={event => setJobsOpen((event.currentTarget as HTMLDetailsElement).open)}><summary className="cursor-pointer text-sm">{t('Processing jobs')}</summary><Button variant="ghost" className="my-2" onClick={() => action(async () => setJobs(await aiSettingsApi.jobs()))}><RefreshCw />{t('Refresh')}</Button><ul className="divide-y">{jobs.slice().reverse().map(job => <li key={job.id} className="flex items-center gap-2 py-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate">{(job.provider ? providerName(job.provider) : '') || t('Processing')} / {jobStatusLabel(job.status)}{job.checkpoint?.progress && job.checkpoint.phase.startsWith('pipeline') ? ` / ${job.checkpoint.progress.done}%` : job.checkpoint?.progress ? ` / ${t('chunk {done} of {total}', { done: Math.min(job.checkpoint.progress.done + (job.status === 'running' ? 1 : 0), job.checkpoint.progress.total), total: job.checkpoint.progress.total })}` : ''}</p><p className="break-words text-xs text-muted-foreground">{job.error || job.checkpoint?.phase || job.recordingId}</p></div>{['running', 'pending'].includes(job.status) && <Button variant="ghost" size="icon" title={t('Cancel processing')} onClick={() => action(async () => { await aiSettingsApi.cancel(job.id); setJobs(await aiSettingsApi.jobs()) })}><X /></Button>}{(job.checkpoint?.remoteId || job.checkpoint?.inFlight === false) && ['failed', 'cancelled'].includes(job.status) && <Button variant="outline" onClick={() => action(async () => { await aiSettingsApi.resume(job.id); setJobs(await aiSettingsApi.jobs()) })}>{t('Resume')}</Button>}</li>)}</ul></details>
++    </fieldset>}
++    {partUsed.length > 0 && <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Credentials')}</legend>{partUsed.map(provider => <div key={provider} className="flex items-end gap-2"><label className="grid flex-1 gap-2 text-sm">{provider === 'custom' ? t('{provider} API key (optional)', { provider: providerName(provider) }) : t('{provider} API key', { provider: labels[provider] })}<Input type="password" autoComplete="off" value={keys[`${provider}ApiKey`] || ''} placeholder={settings.credentials[`${provider}ApiKey`] ? t('Saved key') : t('Not configured')} onChange={e => { setKeys(value => ({ ...value, [`${provider}ApiKey`]: e.target.value })); setEdits(value => value + 1) }} /></label><Button variant="outline" disabled={Object.keys(keys).length > 0} onClick={() => action(async () => { await aiSettingsApi.check(provider); setNotice(t('{provider} connection verified', { provider: providerName(provider) })) })}>{t('Check')}</Button></div>)}</fieldset>}
++    {show('advanced') && <details className="border-t pt-4" onToggle={event => setJobsOpen((event.currentTarget as HTMLDetailsElement).open)}><summary className="cursor-pointer text-sm">{t('Processing jobs')}</summary><Button variant="ghost" className="my-2" onClick={() => action(async () => setJobs(await aiSettingsApi.jobs()))}><RefreshCw />{t('Refresh')}</Button><ul className="divide-y">{jobs.slice().reverse().map(job => <li key={job.id} className="flex items-center gap-2 py-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate">{(job.provider ? providerName(job.provider) : '') || t('Processing')} / {jobStatusLabel(job.status)}{job.checkpoint?.progress && job.checkpoint.phase.startsWith('pipeline') ? ` / ${job.checkpoint.progress.done}%` : job.checkpoint?.progress ? ` / ${t('chunk {done} of {total}', { done: Math.min(job.checkpoint.progress.done + (job.status === 'running' ? 1 : 0), job.checkpoint.progress.total), total: job.checkpoint.progress.total })}` : ''}</p><p className="break-words text-xs text-muted-foreground">{job.error || job.checkpoint?.phase || job.recordingId}</p></div>{['running', 'pending'].includes(job.status) && <Button variant="ghost" size="icon" title={t('Cancel processing')} onClick={() => action(async () => { await aiSettingsApi.cancel(job.id); setJobs(await aiSettingsApi.jobs()) })}><X /></Button>}{(job.checkpoint?.remoteId || job.checkpoint?.inFlight === false) && ['failed', 'cancelled'].includes(job.status) && <Button variant="outline" onClick={() => action(async () => { await aiSettingsApi.resume(job.id); setJobs(await aiSettingsApi.jobs()) })}>{t('Resume')}</Button>}</li>)}</ul></details>}
+   </section>
+ }
+diff --git a/web/src/components/PlaudAuthorization.tsx b/web/src/components/PlaudAuthorization.tsx
+index 661aaf6..b8e2e98 100644
+--- a/web/src/components/PlaudAuthorization.tsx
++++ b/web/src/components/PlaudAuthorization.tsx
+@@ -30,15 +30,11 @@ export function DesktopImportPreferences() {
+     setBusy(true); setError('')
+     try { setState(await plaudRequest<AutoImportStatus>('/auto-import', { enabled }, 'PATCH')) } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
+   }
+-  const updateProcessing = async (key: 'autoTranscribe' | 'autoSummarize', enabled: boolean) => {
+-    setBusy(true); setError('')
+-    try { setSettings(await api.updateSettings({ [key]: enabled })) } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
+-  }
+   return <section className="device-section plaud-preferences"><div className="device-section-heading"><Settings2 /><h2>{t('Import preferences')}</h2></div>
+     <label className="plaud-preference-row"><Download /><span><strong>{t('Automatically import new recordings')}</strong><small>{t('Check every minute while OpenPlod is running')}</small></span><Switch.Root className="plaud-switch" aria-label={t('Automatically import new recordings')} checked={state?.enabled || false} disabled={busy || !state} onCheckedChange={enabled => void toggle(enabled)}><Switch.Thumb /></Switch.Root></label>
+     <div className="plaud-preference-row"><ShieldCheck /><span><strong>{t('Keep originals on device')}</strong><small>{t('Direct imports never delete Plaud audio')}</small></span><Check className="plaud-positive" aria-label={t('Always retained')} /></div>
+-    <label className="plaud-preference-row"><Speech /><span><strong>{t('Transcribe after import')}</strong><small>{settings?.openWhistleForwarding ? t('Processing is managed by OpenWhistle') : t('Use your configured transcription provider')}</small></span><Switch.Root className="plaud-switch" aria-label={t('Transcribe after import')} checked={settings?.autoTranscribe || false} disabled={busy || !settings || settings.openWhistleForwarding} onCheckedChange={enabled => void updateProcessing('autoTranscribe', enabled)}><Switch.Thumb /></Switch.Root></label>
+-    <label className="plaud-preference-row"><FileText /><span><strong>{t('Summarize after transcription')}</strong><small>{t('Generate an AI summary when transcription finishes')}</small></span><Switch.Root className="plaud-switch" aria-label={t('Summarize after transcription')} checked={settings?.autoSummarize || false} disabled={busy || !settings || settings.openWhistleForwarding} onCheckedChange={enabled => void updateProcessing('autoSummarize', enabled)}><Switch.Thumb /></Switch.Root></label>
++    <Link className="plaud-preference-row" to="/settings?section=transcription"><Speech /><span><strong>{t('Transcribe after import')}</strong><small>{settings?.openWhistleForwarding ? t('Processing is managed by OpenWhistle') : t('Changed in Settings, Transcription')}</small></span><span className="device-muted">{settings ? (settings.autoTranscribe ? t('On') : t('Off')) : ''}</span></Link>
++    <Link className="plaud-preference-row" to="/settings?section=ai"><FileText /><span><strong>{t('Summarize after transcription')}</strong><small>{t('Changed in Settings, AI models')}</small></span><span className="device-muted">{settings ? (settings.autoSummarize ? t('On') : t('Off')) : ''}</span></Link>
+     {state?.running && <p role="status" className="device-muted">{t('Checking and importing recordings...')}</p>}
+     {state?.lastChecked && <p className="device-muted">{t('Last checked {time}', { time: formatDate(state.lastChecked, { timeStyle: 'medium' }) })}</p>}
+     {(error || state?.error) && <p className="device-error" role="alert">{error || state?.error}</p>}
+@@ -83,7 +79,7 @@ export function DesktopAuthorizations() {
+     catch (e) { setError((e as Error).message) } finally { setBusy('') }
+   }
+   return <section className="device-section" aria-label={t('Phone authorizations')}>
+-    <div className="device-section-heading"><Smartphone className="size-5" /><h2>{t('Authorize a phone')}</h2><Button asChild size="sm" variant="outline"><Link to="/settings#pairing"><Smartphone />{t('Pair a phone')}</Link></Button></div>
++    <div className="device-section-heading"><Smartphone className="size-5" /><h2>{t('Authorize a phone')}</h2><Button asChild size="sm" variant="outline"><Link to="/android"><Smartphone />{t('Pair a phone')}</Link></Button></div>
+     {requests.length === 0 && <p className="device-muted">{t('Request access from the phone\'s Plaud screen. Approving copies your existing device authorization, encrypted for that phone.')}</p>}
+     {requests.map(request => <div key={request.id} className="device-recording-row">
+       <span><strong>{request.name}</strong><small>{t('Enter the six-character code displayed on that phone.')}</small></span>
+diff --git a/web/src/components/RecordingPreview.tsx b/web/src/components/RecordingPreview.tsx
+index 1d62159..1dfbbdd 100644
+--- a/web/src/components/RecordingPreview.tsx
++++ b/web/src/components/RecordingPreview.tsx
+@@ -703,7 +703,7 @@ export function RecordingPreview({
+         ) : recording && aiReason && !job && (
+           <p className="preview-notice">
+             {aiReason}{" "}
+-            {recording.transcriptText && <Link className="underline" to="/settings">{t("Open Settings")}</Link>}
++            {recording.transcriptText && <Link className="underline" to="/settings?section=ai">{t("Open Settings")}</Link>}
+           </p>
+         )}
+       </div>
+diff --git a/web/src/components/SearchIndexPanel.tsx b/web/src/components/SearchIndexPanel.tsx
+index 042a5d0..efcb566 100644
+--- a/web/src/components/SearchIndexPanel.tsx
++++ b/web/src/components/SearchIndexPanel.tsx
+@@ -1,5 +1,5 @@
+ import { useEffect, useState } from 'react'
+-import { Loader2, RefreshCw, Save, Search } from '@/components/icons'
++import { Loader2, RefreshCw, Search } from '@/components/icons'
+ import { Button } from '@/components/ui/button'
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+ import { knowledgeApi, type IndexStatus, type KnowledgeSettings } from '@/lib/knowledge'
+@@ -29,14 +29,26 @@ export function SearchIndexPanel() {
+     knowledgeApi.searchStatus(controller.signal).then(next => { setStatus(next); setDraft(next.settings) }).catch(e => { if (!controller.signal.aborted) setError((e as Error).message) })
+     return () => controller.abort()
+   }, [])
+-  const cloud = draft?.embeddingProvider === 'openai' || draft?.embeddingProvider === 'mistral'
+-  const save = async () => {
+-    if (!draft) return
+-    if (cloud && !window.confirm(t('Send every indexed transcript and note passage, and each search query, to {provider} to compute embeddings? This may be billed. Local-only mode still blocks it.', { provider: draft.embeddingProvider === 'openai' ? 'OpenAI' : 'Mistral' }))) return
++  const isCloud = (value: KnowledgeSettings | null) => value?.embeddingProvider === 'openai' || value?.embeddingProvider === 'mistral'
++  const cloud = isCloud(draft)
++  // Changes save on their own: a choice at once, typed text 800 ms after the last key.
++  const [edits, setEdits] = useState(0)
++  const save = async (value: KnowledgeSettings) => {
+     setBusy('save'); setError(''); setMessage('')
+-    try { const next = await knowledgeApi.saveSearchSettings({ ...draft, cloudOptIn: cloud, ...(cloud ? { confirmCloud: true } : {}) }); setStatus(next); setDraft(next.settings); setMessage(t('Saved.')) }
++    try { const next = await knowledgeApi.saveSearchSettings({ ...value, cloudOptIn: isCloud(value), ...(isCloud(value) ? { confirmCloud: true } : {}) }); setStatus(next); setMessage(t('Saved.')) }
+     catch (e) { setError((e as Error).message) } finally { setBusy('') }
+   }
++  useEffect(() => {
++    if (!edits || !draft) return
++    const timer = window.setTimeout(() => void save(draft), 800)
++    return () => window.clearTimeout(timer)
++  // eslint-disable-next-line react-hooks/exhaustive-deps -- saves the state as of the latest edit only
++  }, [edits])
++  const choose = (value: KnowledgeSettings) => {
++    // Cloud embeddings send passages off this computer: they are only chosen after a confirmation.
++    if (isCloud(value) && !window.confirm(t('Send every indexed transcript and note passage, and each search query, to {provider} to compute embeddings? This may be billed. Local-only mode still blocks it.', { provider: value.embeddingProvider === 'openai' ? 'OpenAI' : 'Mistral' }))) return
++    setDraft(value); void save(value)
++  }
+   const reindex = async () => {
+     setBusy('index'); setError(''); setMessage('')
+     try { const result = await knowledgeApi.reindex(); setStatus(await knowledgeApi.searchStatus()); setMessage(result.pending ? tn(result.indexed, 'Indexed {count} source; {pending} left, run again to continue.', 'Indexed {count} sources; {pending} left, run again to continue.', { pending: result.pending }) : tn(result.indexed, 'Indexed {count} source.', 'Indexed {count} sources.')) }
+@@ -48,19 +60,18 @@ export function SearchIndexPanel() {
+       <p className="knowledge-note">{t('Hybrid search combines full-text matching with embeddings over the current transcript of each active recording and your notes. Trash is never searched, and cached passages are deleted when a recording is trashed, purged, or re-transcribed.')}</p>
+       {!status && !error && <Loader2 className="size-4 animate-spin" aria-label={t('Loading search settings')} />}
+       {draft && <label className="knowledge-field">{t('Embeddings')}
+-        <select value={draft.embeddingProvider} disabled={!!busy} onChange={e => setDraft({ ...draft, embeddingProvider: e.target.value as KnowledgeSettings['embeddingProvider'] })}>
++        <select value={draft.embeddingProvider} disabled={busy === 'index'} onChange={e => choose({ ...draft, embeddingProvider: e.target.value as KnowledgeSettings['embeddingProvider'] })}>
+           {Object.entries(providerLabel()).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+         </select>
+       </label>}
+       {draft && (draft.embeddingProvider === 'auto' || draft.embeddingProvider === 'ollama') && <label className="knowledge-field">{t('Ollama embedding model')}
+-        <input value={draft.ollamaModel} maxLength={120} disabled={!!busy} spellCheck={false} onChange={e => setDraft({ ...draft, ollamaModel: e.target.value })} />
++        <input value={draft.ollamaModel} maxLength={120} disabled={busy === 'index'} spellCheck={false} onChange={e => { setDraft({ ...draft, ollamaModel: e.target.value }); setEdits(value => value + 1) }} />
+       </label>}
+-      {cloud && <p className="knowledge-note">{t('Cloud embeddings send passages and queries off this computer. Saving asks you to confirm.')}</p>}
++      {cloud && <p className="knowledge-note">{t('Cloud embeddings send passages and queries off this computer.')}</p>}
+       {status && <p className="knowledge-note">{t('In use:')} <strong>{status.embedding.kind === 'lexical' ? t('built-in lexical index') : status.embedding.model}</strong> ({status.embedding.kind}). {tn(status.sources, '{count} source indexed', '{count} sources indexed')}, {tn(status.passages, '{count} passage', '{count} passages')}, {tn(status.pending, '{count} waiting', '{count} waiting')}.{status.embedding.note ? ` ${status.embedding.note}` : ''}</p>}
+       {error && <p className="note-error" role="alert">{error}</p>}
+       {message && <p className="knowledge-note" role="status">{message}</p>}
+       <div className="knowledge-row">
+-        <Button size="sm" disabled={!!busy || !draft} onClick={() => void save()}>{busy === 'save' ? <Loader2 className="animate-spin" /> : <Save />}{t('Save search settings')}</Button>
+         <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void reindex()}>{busy === 'index' ? <Loader2 className="animate-spin" /> : <RefreshCw />}{t('Index now')}</Button>
+         <Search aria-hidden="true" className="size-4 text-muted-foreground" />
+       </div>
+diff --git a/web/src/components/WorkspaceSearch.tsx b/web/src/components/WorkspaceSearch.tsx
+index 362e017..80c2c4b 100644
+--- a/web/src/components/WorkspaceSearch.tsx
++++ b/web/src/components/WorkspaceSearch.tsx
+@@ -25,7 +25,7 @@ const quickActions = (): Action[] => [
+   { id: "record", label: t("Record with the microphone"), hint: t("Action"), icon: Mic, to: "/record", keywords: "capture new recording" },
+   { id: "plaud", label: t("Plaud device"), hint: t("Action"), icon: Bluetooth, to: "/devices", keywords: "bluetooth sync note pro" },
+   { id: "android", label: t("Pair an Android phone"), hint: t("Action"), icon: Smartphone, to: "/android", keywords: "mobile qr" },
+-  { id: "profiles", label: t("Transcription profiles"), hint: t("Settings"), icon: AudioLines, to: "/settings#profiles", keywords: "prompt vocabulary model whisper voxtral" },
++  { id: "profiles", label: t("Transcription profiles"), hint: t("Settings"), icon: AudioLines, to: "/settings?section=transcription#profiles", keywords: "prompt vocabulary model whisper voxtral" },
+   { id: "settings", label: t("Settings"), hint: t("Go to"), icon: Settings, to: "/settings", keywords: "ai providers keys privacy" },
+   { id: "developer", label: t("API and MCP"), hint: t("Go to"), icon: Workflow, to: "/developer", keywords: "developer token claude" },
+   { id: "setup", label: t("Run the setup guide"), hint: t("Action"), icon: Rocket, event: ONBOARDING_EVENT, keywords: "onboarding welcome start" },
+diff --git a/web/src/i18n/fr.ts b/web/src/i18n/fr.ts
+index f0ad466..5beffe7 100644
+--- a/web/src/i18n/fr.ts
++++ b/web/src/i18n/fr.ts
+@@ -5,6 +5,7 @@ import { devices } from './fr/devices'
+ import { pipeline } from './fr/pipeline'
+ import { library } from './fr/library'
+ import { lmstudio } from './fr/lmstudio'
++import { settings } from './fr/settings'
+ 
+ /** French UI strings, keyed by the English source string. Each area keeps its own file. */
+-export const fr: Record<string, string> = { ...workspace, ...studio, ...documents, ...devices, ...pipeline, ...library, ...lmstudio }
++export const fr: Record<string, string> = { ...workspace, ...studio, ...documents, ...devices, ...pipeline, ...library, ...lmstudio, ...settings }
+diff --git a/web/src/i18n/fr/settings.ts b/web/src/i18n/fr/settings.ts
+new file mode 100644
+index 0000000..98bb063
+--- /dev/null
++++ b/web/src/i18n/fr/settings.ts
+@@ -0,0 +1,16 @@
++/** French strings for the Settings sections and saving as you change things. */
++export const settings: Record<string, string> = {
++  'Changes save automatically': 'Les modifications sont enregistrées automatiquement',
++  'Not saved': 'Non enregistré',
++  'Cloud embeddings send passages and queries off this computer.': 'Les embeddings cloud envoient des passages et des requêtes hors de cet ordinateur.',
++  'Changed in Settings, AI models': 'Se modifie dans Réglages, Modèles IA',
++  'Changed in Settings, Transcription': 'Se modifie dans Réglages, Transcription',
++  'AI models': 'Modèles IA',
++  'Advanced': 'Avancé',
++  'Bluetooth imports from the recorder, and their automatic import, are set on the Plaud Device page. Phones pair on the Android page.': 'Les imports Bluetooth depuis l’enregistreur, et leur import automatique, se règlent sur la page Appareil Plaud. Les téléphones s’associent sur la page Android.',
++  'General': 'Général',
++  'Recording & import': 'Enregistrement et import',
++  'Settings sections': 'Sections des réglages',
++  'Storage & backup': 'Stockage et sauvegarde',
++  'Transcribe new recordings as soon as they are imported from the Plaud Device or the sync folder': 'Transcrire les nouveaux enregistrements dès leur import depuis l’appareil Plaud ou le dossier de synchronisation',
++}
+diff --git a/web/src/index.css b/web/src/index.css
+index 196926a..cf90b66 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -406,6 +406,22 @@ button:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid
+ .settings-page > .rounded-lg > div, .settings-page > details > .rounded-lg > div { padding-left: 0; padding-right: 0; }
+ .settings-page > .rounded-lg > div:first-child { padding-top: 24px; }
+ .settings-page h3 { font-size: 14px; }
++/* Settings in sections: a list of sections on the left, one section shown at a time. */
++.settings-layout { width: min(100%, 1120px); }
++.settings-columns { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 32px; align-items: start; }
++.settings-sections { display: flex; flex-direction: column; gap: 2px; position: sticky; top: 16px; }
++.settings-sections button { text-align: left; padding: 8px 12px; border-radius: 6px; font-size: 14px; color: var(--muted-foreground); }
++.settings-sections button:hover { background: var(--secondary); color: var(--foreground); }
++.settings-sections button.active { background: var(--secondary); color: var(--foreground); font-weight: 600; }
++.settings-section { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
++.settings-section > .rounded-lg { border: 0; border-top: 1px solid var(--border); border-radius: 0; box-shadow: none; background: transparent; }
++.settings-section > .rounded-lg > div { padding-left: 0; padding-right: 0; }
++.settings-section > .rounded-lg > div:first-child { padding-top: 24px; }
++@media (max-width: 767px) {
++  .settings-columns { grid-template-columns: minmax(0, 1fr); gap: 16px; }
++  .settings-sections { flex-direction: row; overflow-x: auto; position: static; }
++  .settings-sections button { white-space: nowrap; }
++}
+ 
+ @media (min-width: 768px) and (max-width: 1100px) {
+   .recording-table-head, .recording-table-row { grid-template-columns: minmax(130px, 1fr) 90px 90px 32px; gap: 12px; padding-inline: 8px; }
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index 07dd275..ad32383 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useRef, useState } from 'react'
+-import { Link, useLocation } from 'react-router-dom'
+-import { Save, Loader2, AlertCircle, Smartphone, Rocket } from "@/components/icons"
++import { Link, useLocation, useSearchParams } from 'react-router-dom'
++import { AlertCircle, Bluetooth, Rocket, Smartphone, Workflow } from "@/components/icons"
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+ import { Input } from '@/components/ui/input'
+ import { Button } from '@/components/ui/button'
+@@ -36,20 +36,30 @@ function Toggle({ checked, onChange, label, description }: { checked: boolean; o
+   )
+ }
+ 
++export type SettingsSection = 'general' | 'recording' | 'transcription' | 'ai' | 'storage' | 'advanced'
++const SECTIONS: SettingsSection[] = ['general', 'recording', 'transcription', 'ai', 'storage', 'advanced']
++const sectionLabel = (section: SettingsSection) => ({
++  general: t('General'), recording: t('Recording & import'), transcription: t('Transcription'),
++  ai: t('AI models'), storage: t('Storage & backup'), advanced: t('Advanced'),
++})[section]
++/** Older links pointed at an anchor on one long page; each anchor now lives in a section. */
++const HASH_SECTIONS: Record<string, SettingsSection> = { pairing: 'recording', profiles: 'transcription', backup: 'storage', search: 'ai' }
++
++/**
++ * Settings in sections, one shown at a time (`?section=`). Everything saves on its own shortly after
++ * a change; there are no Save buttons to forget.
++ */
+ export function SettingsPage() {
+   const { hash } = useLocation()
+-  const pairingSection = useRef<HTMLDetailsElement>(null)
++  const [params, setParams] = useSearchParams()
++  const requested = params.get('section') as SettingsSection | null
++  const section: SettingsSection = requested && SECTIONS.includes(requested) ? requested : HASH_SECTIONS[hash.slice(1)] ?? 'general'
+   useEffect(() => {
+-    if (hash === '#pairing' && pairingSection.current) {
+-      pairingSection.current.open = true
+-      pairingSection.current.scrollIntoView({ block: 'start' })
+-    }
+-    // Sections that load asynchronously (profiles) are scrolled to once they render.
+-    else if (hash.length > 1) {
+-      const timer = window.setTimeout(() => document.getElementById(hash.slice(1))?.scrollIntoView({ block: 'start' }), 300)
+-      return () => window.clearTimeout(timer)
+-    }
+-  }, [hash])
++    // An anchor inside the section (for example #profiles) is scrolled to once it has rendered.
++    if (hash.length < 2) return
++    const timer = window.setTimeout(() => document.getElementById(hash.slice(1))?.scrollIntoView({ block: 'start' }), 300)
++    return () => window.clearTimeout(timer)
++  }, [hash, section])
+   const runtime = getRuntime()
+   const locale = useLocale()
+   const [settings, setSettings] = useState<Settings>({
+@@ -70,49 +80,55 @@ export function SettingsPage() {
+     openWhistleApiKeyConfigured: false,
+     openWhistleAgentId: '',
+   })
+-  const [saving, setSaving] = useState(false)
+   const [loaded, setLoaded] = useState(false)
+-  const [saved, setSaved] = useState(false)
++  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+   const [error, setError] = useState('')
+-  const savedTimer = useRef<number | null>(null)
++  // The installed app's version (from the desktop shell); the web build's own number elsewhere.
++  const [appVersion, setAppVersion] = useState(buildInfo.version)
++  useEffect(() => {
++    if (runtime.mode !== 'desktop') return
++    let disposed = false
++    void import('@tauri-apps/api/app').then(({ getVersion }) => getVersion()).then(version => { if (!disposed) setAppVersion(version) }).catch(() => {})
++    return () => { disposed = true }
++  }, [runtime.mode])
+ 
+   useEffect(() => {
+     api.getSettings().then(value => { setSettings(value); setLoaded(true) }).catch(loadError => {
+       setError(loadError instanceof Error ? loadError.message : t('Could not load settings'))
+     })
+-    return () => {
+-      if (savedTimer.current) window.clearTimeout(savedTimer.current)
+-    }
+   }, [])
+ 
+-  const save = async () => {
+-    setSaving(true)
+-    setError('')
+-    try {
+-      const general = Object.fromEntries(Object.entries(settings).filter(([key]) => !['transcriptionEngine', 'mistralApiKey', 'deepgramApiKey'].includes(key))) as Partial<Settings>
+-      setSettings(await api.updateSettings(general))
+-      setSaved(true)
+-      if (savedTimer.current) window.clearTimeout(savedTimer.current)
+-      savedTimer.current = window.setTimeout(() => setSaved(false), 2000)
+-    } catch (saveError) {
+-      setError(saveError instanceof Error ? saveError.message : t('Could not save settings'))
+-    } finally {
+-      setSaving(false)
+-    }
+-  }
+-
+-  const update = (patch: Partial<Settings>) => setSettings(s => ({ ...s, ...patch }))
++  // Autosave: every change bumps `edits`; the save runs 800 ms after the last one.
++  const [edits, setEdits] = useState(0)
++  const latest = useRef(settings)
++  latest.current = settings
++  useEffect(() => {
++    if (!edits || !loaded) return
++    const timer = window.setTimeout(async () => {
++      setSaveState('saving')
++      try {
++        const general = Object.fromEntries(Object.entries(latest.current).filter(([key]) => !['transcriptionEngine', 'mistralApiKey', 'deepgramApiKey'].includes(key))) as Partial<Settings>
++        const saved = await api.updateSettings(general)
++        // Keep what is typed; take only what the server reports back about stored keys.
++        setSettings(current => ({ ...current, openWhistleApiKeyConfigured: saved.openWhistleApiKeyConfigured, mistralApiKeyConfigured: saved.mistralApiKeyConfigured, deepgramApiKeyConfigured: saved.deepgramApiKeyConfigured }))
++        setError(''); setSaveState('saved')
++      } catch (saveError) {
++        setSaveState('error'); setError(saveError instanceof Error ? saveError.message : t('Could not save settings'))
++      }
++    }, 800)
++    return () => window.clearTimeout(timer)
++  }, [edits, loaded])
++
++  const update = (patch: Partial<Settings>) => { setSettings(s => ({ ...s, ...patch })); setEdits(value => value + 1) }
++  const go = (next: SettingsSection) => setParams(next === 'general' ? {} : { section: next })
++
++  const status = saveState === 'saving' ? t('Saving...') : saveState === 'saved' ? t('Saved') : saveState === 'error' ? t('Not saved') : t('Changes save automatically')
+ 
+   return (
+-    <div className="settings-page">
+-      <div className="flex items-center justify-between">
+-        <div>
+-          <h1>{t('Settings')}</h1>
+-        </div>
+-        <Button onClick={save} disabled={saving || !loaded}>
+-          {saving ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Save className="h-4 w-4 mr-2" />}
+-          {saved ? t('Saved!') : t('Save')}
+-        </Button>
++    <div className="settings-page settings-layout">
++      <div className="flex items-center justify-between gap-3">
++        <h1>{t('Settings')}</h1>
++        <span className="text-xs text-muted-foreground" role="status">{status}</span>
+       </div>
+ 
+       {error && (
+@@ -122,131 +138,111 @@ export function SettingsPage() {
+         </div>
+       )}
+ 
+-      <div className="flex items-center justify-between gap-4 border-b pb-4">
+-        <label htmlFor="settings-language" className="text-sm font-medium">{t('Language')}</label>
+-        <select id="settings-language" className="rounded-md border bg-background px-2 py-1 text-sm" value={locale} onChange={event => setLocale(event.target.value as Locale)}>
+-          {LOCALES.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
+-        </select>
+-      </div>
++      <div className="settings-columns">
++        <nav className="settings-sections" aria-label={t('Settings sections')}>
++          {SECTIONS.map(item => (
++            <button key={item} type="button" aria-current={section === item ? 'page' : undefined} className={section === item ? 'active' : ''} onClick={() => go(item)}>
++              {sectionLabel(item)}
++            </button>
++          ))}
++        </nav>
+ 
+-      <div className="flex items-center justify-between gap-4 border-b pb-4">
+-        <span className="text-sm font-medium">{t('API & MCP')}</span>
+-        <Button asChild variant="outline" size="sm"><Link to="/developer">{t('Open API & MCP')}</Link></Button>
+-      </div>
++        <div className="settings-section" aria-label={sectionLabel(section)}>
++          <h2 className="text-lg font-semibold">{sectionLabel(section)}</h2>
+ 
+-      <details className="border-b pb-4">
+-        <summary className="cursor-pointer text-sm text-muted-foreground">{t('About OpenPlod')}</summary>
+-        <dl className="grid gap-3 py-4 text-sm"><div><dt className="text-muted-foreground">{t('Version')}</dt><dd>{buildInfo.version}</dd></div><div><dt className="text-muted-foreground">{t('Installed build')}</dt><dd><time dateTime={buildInfo.builtAt}>{buildLabel}</time></dd></div><div><dt className="text-muted-foreground">{t('Platform')}</dt><dd>{runtime.mode === 'desktop' ? t('Desktop') : runtime.mode === 'mobile' ? t('Mobile') : t('Browser')}</dd></div></dl>
+-        <Button variant="outline" onClick={() => { void onboardingApi.reset().catch(() => {}).finally(() => window.dispatchEvent(new Event(ONBOARDING_EVENT))) }}><Rocket />{t('Run the setup guide again')}</Button>
+-        <UpdatePanel />
+-      </details>
+-
+-      <details id="pairing" ref={pairingSection} className="border-b pb-4">
+-        <summary className="cursor-pointer text-sm text-muted-foreground">{t('Mobile pairing')}</summary>
+-        <Button asChild variant="outline" className="mt-4"><Link to="/android"><Smartphone />{t('Android connection')}</Link></Button>
+-      </details>
+-
+-      <AiSettingsPanel />
+-      <TranscriptionProfilesPanel />
+-      <BackupRestorePanel />
+-      <SearchIndexPanel />
+-
+-      {/* Sync */}
+-      <Card>
+-        <CardHeader className="pb-3">
+-          <CardTitle className="text-base">{t('Sync')}</CardTitle>
+-        </CardHeader>
+-        <CardContent className="space-y-4">
+-          <div className="space-y-2">
+-            <label htmlFor="settings-sync-folder" className="text-sm font-medium">{t('Plaud Sync Folder')}</label>
+-            <Input
+-              id="settings-sync-folder"
+-              value={settings.syncFolderPath}
+-              onChange={e => update({ syncFolderPath: e.target.value })}
+-            />
+-            <p className="text-xs text-muted-foreground">{t('Path to your PlaudSync folder on this machine')}</p>
+-          </div>
+-        </CardContent>
+-      </Card>
+-
+-      {/* Automation */}
+-      <Card>
+-        <CardHeader className="pb-3">
+-          <CardTitle className="text-base">{t('Automation')}</CardTitle>
+-        </CardHeader>
+-        <CardContent className="divide-y">
+-          <Toggle
+-            checked={settings.autoImport}
+-            onChange={v => update({ autoImport: v })}
+-            label={t('Auto-import Plaud recordings')}
+-            description={t('Import new files when they appear in the Plaud sync folder')}
+-          />
+-          <div className="py-3">
+-            <p className="text-sm font-medium">{t('Recording types')}</p>
+-            <p className="mb-3 text-xs text-muted-foreground">{t('Choose which detected Plaud exports are imported automatically')}</p>
+-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+-              {['class', 'meeting', 'conversation', 'other'].map(type => (
+-                <label key={type} className="flex items-center gap-2 text-sm capitalize">
+-                  <input
+-                    type="checkbox"
+-                    checked={settings.plaudRecordingTypes.includes(type)}
+-                    onChange={() => update({
+-                      plaudRecordingTypes: settings.plaudRecordingTypes.includes(type)
+-                        ? settings.plaudRecordingTypes.filter(value => value !== type)
+-                        : [...settings.plaudRecordingTypes, type],
+-                    })}
+-                  />
+-                  {({ class: t('Class'), meeting: t('Meeting'), conversation: t('Conversation'), other: t('Other') } as Record<string, string>)[type]}
+-                </label>
+-              ))}
++          {section === 'general' && <>
++            <div className="flex items-center justify-between gap-4 border-b pb-4">
++              <label htmlFor="settings-language" className="text-sm font-medium">{t('Language')}</label>
++              <select id="settings-language" className="rounded-md border bg-background px-2 py-1 text-sm" value={locale} onChange={event => setLocale(event.target.value as Locale)}>
++                {LOCALES.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}
++              </select>
+             </div>
+-          </div>
+-          <Toggle
+-            checked={settings.deleteSourceAfterImport}
+-            onChange={v => update({ deleteSourceAfterImport: v })}
+-            label={t('Delete exported file after import')}
+-            description={t('Keep the durable vault copy and remove the source export')}
+-          />
+-          <Toggle
+-            checked={settings.autoTranscribe}
+-            onChange={v => update({ autoTranscribe: v })}
+-            label={t('Auto-transcribe')}
+-            description={t('Automatically transcribe new recordings when synced')}
+-          />
+-          <Toggle
+-            checked={settings.autoSummarize}
+-            onChange={v => update({ autoSummarize: v })}
+-            label={t('Auto-summarize')}
+-            description={t('Generate AI summary after transcription completes')}
+-          />
+-        </CardContent>
+-      </Card>
+-
+-      <Card>
+-        <CardHeader className="pb-3">
+-          <CardTitle className="text-base">OpenWhistle</CardTitle>
+-        </CardHeader>
+-        <CardContent className="space-y-4">
+-          <Toggle
+-            checked={settings.openWhistleForwarding}
+-            onChange={v => update({ openWhistleForwarding: v })}
+-            label={t('Forward recordings')}
+-            description={t('Send imported audio to OpenWhistle for agents and connectors')}
+-          />
+-          <div className="space-y-2">
+-            <label htmlFor="settings-ow-url" className="text-sm font-medium">{t('API base URL')}</label>
+-            <Input id="settings-ow-url" value={settings.openWhistleBaseUrl} onChange={e => update({ openWhistleBaseUrl: e.target.value })} placeholder="https://openwhistle.pro/api/v1" />
+-          </div>
+-          <div className="space-y-2">
+-            <label htmlFor="settings-ow-agent" className="text-sm font-medium">{t('Agent ID')}</label>
+-            <Input id="settings-ow-agent" value={settings.openWhistleAgentId} onChange={e => update({ openWhistleAgentId: e.target.value })} />
+-          </div>
+-          <div className="space-y-2">
+-            <label htmlFor="settings-ow-key" className="text-sm font-medium">{t('API key')}</label>
+-            <Input id="settings-ow-key" type="password" value={settings.openWhistleApiKey || ''} onChange={e => update({ openWhistleApiKey: e.target.value })} placeholder={settings.openWhistleApiKeyConfigured ? t('Saved key (enter a new key to replace)') : 'owk_...'} />
+-          </div>
+-        </CardContent>
+-      </Card>
++            <dl className="grid gap-3 border-b pb-4 text-sm"><div><dt className="text-muted-foreground">{t('Version')}</dt><dd>{appVersion}</dd></div><div><dt className="text-muted-foreground">{t('Installed build')}</dt><dd><time dateTime={buildInfo.builtAt}>{buildLabel}</time></dd></div><div><dt className="text-muted-foreground">{t('Platform')}</dt><dd>{runtime.mode === 'desktop' ? t('Desktop') : runtime.mode === 'mobile' ? t('Mobile') : t('Browser')}</dd></div></dl>
++            <UpdatePanel />
++            <div className="flex flex-wrap gap-2 border-t pt-4">
++              <Button variant="outline" onClick={() => { void onboardingApi.reset().catch(() => {}).finally(() => window.dispatchEvent(new Event(ONBOARDING_EVENT))) }}><Rocket />{t('Run the setup guide again')}</Button>
++              <Button asChild variant="outline"><Link to="/developer"><Workflow />{t('Open API & MCP')}</Link></Button>
++            </div>
++          </>}
++
++          {section === 'recording' && <>
++            <div className="grid gap-2 border-b pb-4 text-sm">
++              <p className="text-muted-foreground">{t('Bluetooth imports from the recorder, and their automatic import, are set on the Plaud Device page. Phones pair on the Android page.')}</p>
++              <div className="flex flex-wrap gap-2">
++                <Button asChild variant="outline" size="sm"><Link to="/devices"><Bluetooth />{t('Plaud Device')}</Link></Button>
++                <Button asChild variant="outline" size="sm"><Link to="/android"><Smartphone />{t('Android connection')}</Link></Button>
++              </div>
++            </div>
++            <div className="space-y-2">
++              <label htmlFor="settings-sync-folder" className="text-sm font-medium">{t('Plaud Sync Folder')}</label>
++              <Input id="settings-sync-folder" value={settings.syncFolderPath} onChange={e => update({ syncFolderPath: e.target.value })} />
++              <p className="text-xs text-muted-foreground">{t('Path to your PlaudSync folder on this machine')}</p>
++            </div>
++            <div className="divide-y">
++              <Toggle checked={settings.autoImport} onChange={v => update({ autoImport: v })} label={t('Auto-import Plaud recordings')} description={t('Import new files when they appear in the Plaud sync folder')} />
++              <div className="py-3">
++                <p className="text-sm font-medium">{t('Recording types')}</p>
++                <p className="mb-3 text-xs text-muted-foreground">{t('Choose which detected Plaud exports are imported automatically')}</p>
++                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
++                  {['class', 'meeting', 'conversation', 'other'].map(type => (
++                    <label key={type} className="flex items-center gap-2 text-sm capitalize">
++                      <input
++                        type="checkbox"
++                        checked={settings.plaudRecordingTypes.includes(type)}
++                        onChange={() => update({
++                          plaudRecordingTypes: settings.plaudRecordingTypes.includes(type)
++                            ? settings.plaudRecordingTypes.filter(value => value !== type)
++                            : [...settings.plaudRecordingTypes, type],
++                        })}
++                      />
++                      {({ class: t('Class'), meeting: t('Meeting'), conversation: t('Conversation'), other: t('Other') } as Record<string, string>)[type]}
++                    </label>
++                  ))}
++                </div>
++              </div>
++              <Toggle checked={settings.deleteSourceAfterImport} onChange={v => update({ deleteSourceAfterImport: v })} label={t('Delete exported file after import')} description={t('Keep the durable vault copy and remove the source export')} />
++            </div>
++          </>}
++
++          {section === 'transcription' && <>
++            <Toggle checked={settings.autoTranscribe} onChange={v => update({ autoTranscribe: v })} label={t('Auto-transcribe')} description={t('Transcribe new recordings as soon as they are imported from the Plaud Device or the sync folder')} />
++            <AiSettingsPanel part="transcription" />
++            <TranscriptionProfilesPanel />
++          </>}
++
++          {section === 'ai' && <>
++            <Toggle checked={settings.autoSummarize} onChange={v => update({ autoSummarize: v })} label={t('Auto-summarize')} description={t('Generate AI summary after transcription completes')} />
++            <AiSettingsPanel part="models" />
++            <SearchIndexPanel />
++          </>}
++
++          {section === 'storage' && <BackupRestorePanel />}
++
++          {section === 'advanced' && <>
++            <AiSettingsPanel part="advanced" />
++            <Card>
++              <CardHeader className="pb-3">
++                <CardTitle className="text-base">OpenWhistle</CardTitle>
++              </CardHeader>
++              <CardContent className="space-y-4">
++                <Toggle checked={settings.openWhistleForwarding} onChange={v => update({ openWhistleForwarding: v })} label={t('Forward recordings')} description={t('Send imported audio to OpenWhistle for agents and connectors')} />
++                <div className="space-y-2">
++                  <label htmlFor="settings-ow-url" className="text-sm font-medium">{t('API base URL')}</label>
++                  <Input id="settings-ow-url" value={settings.openWhistleBaseUrl} onChange={e => update({ openWhistleBaseUrl: e.target.value })} placeholder="https://openwhistle.pro/api/v1" />
++                </div>
++                <div className="space-y-2">
++                  <label htmlFor="settings-ow-agent" className="text-sm font-medium">{t('Agent ID')}</label>
++                  <Input id="settings-ow-agent" value={settings.openWhistleAgentId} onChange={e => update({ openWhistleAgentId: e.target.value })} />
++                </div>
++                <div className="space-y-2">
++                  <label htmlFor="settings-ow-key" className="text-sm font-medium">{t('API key')}</label>
++                  <Input id="settings-ow-key" type="password" value={settings.openWhistleApiKey || ''} onChange={e => update({ openWhistleApiKey: e.target.value })} placeholder={settings.openWhistleApiKeyConfigured ? t('Saved key (enter a new key to replace)') : 'owk_...'} />
++                </div>
++              </CardContent>
++            </Card>
++          </>}
++        </div>
++      </div>
+     </div>
+   )
+ }
