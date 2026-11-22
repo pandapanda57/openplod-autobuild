@@ -31,7 +31,9 @@ for (const [index, file] of files.entries()) {
   const log = join(logs, `${index}.log`);
   const fd = openSync(log, 'w');
   const started = Date.now();
-  const result = spawnSync(process.execPath, ['test', file], { cwd: root, stdio: ['ignore', fd, fd], timeout: 120_000, windowsHide: true });
+  // --timeout: Bun's 5 s per-test default is too short for the vault backup test on the hosted
+  // Windows runner's disk (build4 run timed out at 5001 ms). The 120 s cap per file still applies.
+  const result = spawnSync(process.execPath, ['test', '--timeout', '30000', file], { cwd: root, stdio: ['ignore', fd, fd], timeout: 120_000, windowsHide: true });
   closeSync(fd);
   const text = readFileSync(log, 'utf8');
   const passed = Number(/(\d+) pass/.exec(text)?.[1] ?? 0), failed = Number(/(\d+) fail/.exec(text)?.[1] ?? 0);
