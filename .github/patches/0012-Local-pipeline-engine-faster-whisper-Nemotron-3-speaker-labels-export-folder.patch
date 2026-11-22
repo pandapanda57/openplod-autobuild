@@ -1,0 +1,1501 @@
+Subject: [PATCH] Local pipeline engine: faster-whisper + Nemotron-3 speaker labels, export folder
+
+Adds a 'local-pipeline' transcription engine (faster-whisper large-v3-turbo + NeMo-Speech.cpp
+Nemotron-3 diarization, run by a built-in Python script at below-normal priority, Hugging Face
+offline), makes it the default for a vault with no transcription setting, adds Settings fields
+for its paths (desktop app only) and an export folder written by temp-folder rename.
+See docs/local-pipeline.md.
+---
+diff --git a/docs/local-pipeline.md b/docs/local-pipeline.md
+new file mode 100644
+index 0000000..cb24b42
+--- /dev/null
++++ b/docs/local-pipeline.md
+@@ -0,0 +1,111 @@
++# Local pipeline: faster-whisper + Nemotron-3 speaker labels
++
++The **Local pipeline** engine transcribes on this computer with faster-whisper `large-v3-turbo` and labels
++speakers with NVIDIA's Nemotron-3 diarization model through the NeMo-Speech.cpp command-line tool. It is the
++default engine when a vault has no transcription setting saved. Every option stays selectable in
++**Settings → AI providers**: you can pick another engine, model, language or profile, or turn speaker labels off.
++
++Nothing is sent anywhere. The engine counts as local, so **Local only** mode allows it. Hugging Face is forced
++offline while it runs (`HF_HUB_OFFLINE=1`), so a model that is not already in the local cache fails with a clear
++message instead of downloading.
++
++## What it runs
++
++The Python script is built into the OpenPlod service (`src/transcription/local-pipeline.py`). On first use it is
++written to the work folder. Each recording gets its own work folder. The script runs at Windows **below normal**
++CPU priority, and ffmpeg and nemo-speech inherit it.
++
++1. **Decode:** `ffmpeg -v error -y -i <audio> -ac 1 -ar 16000 -c:a pcm_s16le audio16k.wav`. The input is the
++   recording's `decoded-original.ogg` when it has one, otherwise its `.m4a`.
++2. **Speech to text:** `WhisperModel(<model>, device="cpu", compute_type="int8", cpu_threads=<all cores>)`, then
++   `transcribe(samples, language, vad_filter=True, word_timestamps=True, beam_size=5, initial_prompt=<prompt>)`.
++   The samples are float32, read with `soundfile`, because faster-whisper 1.2.1's own decoder breaks on PyAV 19.
++   The initial prompt is the **Context prompt**, then the **Vocabulary hints** as a comma-separated list. Profiles
++   add their own prompt and vocabulary. Writes `asr.json`.
++3. **Speaker labels:** `nemo-speech diarize audio16k.wav --device auto --preset v3-offline --format rttm
++   --recording-id <YYYY-MM-DD_HHMM_meeting> --output diar.rttm --force`. The builds are tried in order (see
++   below), and if one fails the next is tried. Writes `diar.rttm` and `diar.json`, whose `meta.engine` is
++   `nemotron-3-diarization/v3-offline`.
++4. **Merge:** each Whisper segment gets one speaker: the one whose turns overlap it most, else the turn covering
++   its midpoint, else the nearest turn. Never word by word. Consecutive segments with the same speaker are
++   joined when the gap is under 2.0 s. Speakers are named `Speaker A`, `Speaker B`, … in order of first
++   appearance. Writes `transcript.json` and `transcript.md`.
++
++`timing.txt` records `start`, `asr wall_sec`, `diarize wall_sec`, `merge wall_sec` and `end`, or `FAILED <step>`.
++The job list in **Settings → AI providers → Processing jobs** shows the step (1, 2 or 3 of 3) and the percent of
++audio done.
++
++A run is stopped after 3× the audio length plus 15 minutes. **Cancel** stops the script and everything it started.
++
++## Install (once per computer, Windows)
++
++1. **Python with faster-whisper.** The default location is `%LOCALAPPDATA%\plaud-asr\.venv`:
++   ```powershell
++   py -3.12 -m venv "$env:LOCALAPPDATA\plaud-asr\.venv"
++   & "$env:LOCALAPPDATA\plaud-asr\.venv\Scripts\python.exe" -m pip install faster-whisper==1.2.1 soundfile
++   ```
++   Then download the model once, while online, so it is in the Hugging Face cache:
++   ```powershell
++   & "$env:LOCALAPPDATA\plaud-asr\.venv\Scripts\python.exe" -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')"
++   ```
++2. **NeMo-Speech.cpp 0.3.0.** Download `nemo-speech-0.3.0-windows-x86_64-vulkan.zip` (GPU) and
++   `nemo-speech-0.3.0-windows-x86_64-cpu.zip` from
++   <https://github.com/NVIDIA/NeMo-Speech.cpp/releases/tag/v0.3.0>. Check each against that release's
++   `SHA256SUMS`:
++   - cpu: `4ed9740e361e4653f56c3dce7d1e81883a1c8b831c1bd7d01567fff1130b5b05`
++   - vulkan: `72b3b8b41bfe2be0320eff4e9d310594e4f99deefcde4a157799a039656963ce`
++
++   Unzip them to `%LOCALAPPDATA%\nemo-speech\0.3.0-vulkan\` and `%LOCALAPPDATA%\nemo-speech\0.3.0-cpu\`. Then
++   fetch the model once with either build (the tool checks its size and SHA-256 itself):
++   `nemo-speech.exe pull nemotron-3-diarization`.
++3. **ffmpeg.** OpenPlod's Windows installer bundles ffmpeg and puts it first on the service's PATH, so nothing
++   else is needed.
++
++## Settings (Settings → AI providers → Local pipeline)
++
++Leave a field empty to use its default. Each field shows the value it resolves to. Only the desktop app on this
++computer can change these fields: a paired phone or an `OPENPLOD_API_TOKEN` script gets `403`.
++
++| Field | Empty means (in this order) |
++| --- | --- |
++| Pipeline Python | env `PIPELINE_PYTHON`, then `%LOCALAPPDATA%\plaud-asr\.venv\Scripts\python.exe` |
++| nemo-speech.exe | env `NEMO_SPEECH_EXE`, then `%LOCALAPPDATA%\nemo-speech\*vulkan*\…\bin\nemo-speech.exe` (newest first), then `*cpu*` |
++| Work folder | env `PIPELINE_WORK_DIR`, then `%LOCALAPPDATA%\OpenPlodPipeline` |
++| Export (checkbox) | on |
++| Export folder | env `OPENPLOD_EXPORT_DIR`, then `%LOCALAPPDATA%\OpenPlodExport` |
++
++The engine is available when the Python and at least one nemo-speech build are found. Otherwise the error says
++which one is missing.
++
++## Export folder
++
++After each successful local-pipeline transcript with speaker labels, OpenPlod writes one folder per recording:
++
++```
++<export folder>\YYYY-MM-DD_HHMM_meeting\
++    audio.ogg  asr.json  diar.json  diar.rttm  transcript.json  transcript.md  timing.txt
++    openplod.json   {"recording_id", "source_recording_id", "recorded_at", "duration_seconds", "app_version"}
++```
++
++- The name is the local clock time the recording **started**. For a recording read from the recorder over
++  Bluetooth, that comes from its session id (the start time in Unix seconds). OpenPlod's `recorded_at` field
++  holds the import time for those, so it is only used as a fallback.
++- The files are copied into a hidden `.tmp-…` folder inside the export folder and renamed into place at the
++  end. A folder carrying the final name is always complete.
++- An existing folder is never overwritten: the next one is `…_meeting_2`, then `_3`, and so on.
++- With speaker labels off, nothing is exported, because `diar.json` would be missing.
++- A failed export is logged and never fails the transcript.
++
++## Local API
++
++- **Address:** `http://127.0.0.1:3487` (the desktop app's service. The port is fixed in `src-tauri/src/lib.rs`;
++  a source-run server reads `PORT`).
++- **Authentication:** header `X-OpenPlod-Token`. Use the desktop pairing token (the `pairing-token` file in the
++  vault folder; full access over loopback) or a separate `OPENPLOD_API_TOKEN`. See `docs/api.md`,
++  Authentication and Exposure.
++- **List recordings:** `GET /api/recordings?limit=100` (rows include `hasTranscript`).
++- **Get a recording's transcript:** `GET /api/recordings/:id` (current transcript with segments and speakers) or
++  `GET /api/recordings/:id/transcript/versions` (every version with provenance).
++- **Start a transcription:** `POST /api/v1/jobs` with
++  `{"type": "process-recording", "recordingId": "<id>", "confirm": true}`. Watch it with `GET /api/v1/jobs/:id`.
++  The local pipeline needs no cloud consent or cost confirmation.
+diff --git a/src/ai/capabilities.ts b/src/ai/capabilities.ts
+index bb80833..846aa7f 100644
+--- a/src/ai/capabilities.ts
++++ b/src/ai/capabilities.ts
+@@ -17,6 +17,10 @@ const VOXTRAL_LANGUAGES = ['en', 'es', 'fr', 'pt', 'hi', 'de', 'nl', 'it'] as co
+  * timed utterances when speaker labels are on.
+  */
+ export const speechCapabilities = {
++  // faster-whisper + Nemotron-3 speaker labels, run by a Python script on this computer (local-pipeline.ts).
++  'local-pipeline': { label: 'Local pipeline (faster-whisper + Nemotron-3)', local: true, models: ['large-v3-turbo', 'large-v3', 'medium', 'small', 'small.en'], timestamps: true, diarization: true, vocabulary: true, prompt: true, maxBytes: null, formats: ['wav', 'm4a', 'mp3', 'flac', 'ogg', 'webm', 'aac'], streaming: false,
++    languages: { 'large-v3-turbo': WHISPER_LANGUAGES, 'large-v3': WHISPER_LANGUAGES, medium: WHISPER_LANGUAGES, small: WHISPER_LANGUAGES, 'small.en': ['en'] },
++    timestampGranularity: { 'large-v3-turbo': 'word', 'large-v3': 'word', medium: 'word', small: 'word', 'small.en': 'word' } },
+   whisper: { label: 'Whisper.cpp', local: true, models: ['base', 'small', 'medium'], timestamps: true, diarization: false, vocabulary: true, prompt: true, maxBytes: null, formats: ['wav', 'm4a', 'mp3', 'flac', 'ogg', 'webm', 'aac'], streaming: false,
+     languages: { base: WHISPER_LANGUAGES, small: WHISPER_LANGUAGES, medium: WHISPER_LANGUAGES }, timestampGranularity: { base: 'segment', small: 'segment', medium: 'segment' } },
+   mistral: { label: 'Mistral Voxtral', local: false, models: ['voxtral-mini-latest'], timestamps: true, diarization: false, vocabulary: false, prompt: false, maxBytes: null, formats: ['wav', 'm4a', 'mp3', 'flac', 'ogg', 'webm', 'aac'], streaming: false,
+diff --git a/src/ai/config.ts b/src/ai/config.ts
+index 93ff1fc..1f12f50 100644
+--- a/src/ai/config.ts
++++ b/src/ai/config.ts
+@@ -2,12 +2,16 @@ import type { Database } from 'bun:sqlite';
+ import { z } from 'zod';
+ import { revealSettings } from '../vault/secrets';
+ 
+-export const speechProviders = ['whisper', 'mistral', 'deepgram', 'openai', 'assemblyai'] as const;
++export const speechProviders = ['local-pipeline', 'whisper', 'mistral', 'deepgram', 'openai', 'assemblyai'] as const;
++/** Speech providers that run on this computer. */
++export const localSpeechProviders: readonly string[] = ['local-pipeline', 'whisper'];
+ export const textProviders = ['mistral', 'openai', 'anthropic', 'ollama', 'gemini', 'custom'] as const;
+ export type SpeechProvider = typeof speechProviders[number];
+ export type TextProvider = typeof textProviders[number];
+ export type TextTask = 'analysis' | 'document' | 'chat';
+ const model = z.string().trim().max(120).regex(/^[a-zA-Z0-9_.:/-]*$/);
++/** A local file or folder path typed in Settings; '' means detect or use the default. */
++const localPath = z.string().trim().max(400).regex(/^[^\r\n\0"*?<>|]*$/).default('');
+ const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+ /**
+  * The restricted custom OpenAI-compatible endpoint (AI-14). HTTPS is required
+@@ -27,7 +31,8 @@ const fallbackEntry = z.object({ provider: z.enum(textProviders), model: model.d
+ const usd = z.number().finite().min(0).max(100000).nullable().default(null);
+ export const aiConfigSchema = z.object({
+   privacyMode: z.enum(['selected-providers', 'local-only']).default('selected-providers'),
+-  transcriptionEngine: z.enum(speechProviders).default('whisper'),
++  /** A vault with no transcription setting gets DEFAULT_TRANSCRIPTION (see aiConfigFromSettings). */
++  transcriptionEngine: z.enum(speechProviders).default('local-pipeline'),
+   transcriptionModel: model.default(''),
+   transcriptionLanguage: z.string().regex(/^(auto|[a-z]{2,3}(-[A-Z]{2})?)$/).default('auto'),
+   transcriptionDiarize: z.boolean().default(false),
+@@ -52,7 +57,19 @@ export const aiConfigSchema = z.object({
+   confirmAboveUsd: usd,
+   /** Split audio longer than this many minutes into chunks (0: only when a provider's size limit requires it). */
+   transcriptionChunkAboveMinutes: z.number().int().min(0).max(1440).default(0),
++  /** Local pipeline: Python with faster-whisper ('' = %LOCALAPPDATA%\plaud-asr\.venv, or env PIPELINE_PYTHON). */
++  pipelinePython: localPath,
++  /** Local pipeline: nemo-speech.exe ('' = env NEMO_SPEECH_EXE, then the newest Vulkan build, then CPU). */
++  pipelineNemoExe: localPath,
++  /** Local pipeline: folder for per-recording work files ('' = %LOCALAPPDATA%\OpenPlodPipeline, or env PIPELINE_WORK_DIR). */
++  pipelineWorkFolder: localPath,
++  /** After a local-pipeline transcript, copy its files to the export folder. */
++  transcriptExport: z.boolean().default(true),
++  /** Export folder ('' = %LOCALAPPDATA%\OpenPlodExport, or env OPENPLOD_EXPORT_DIR). */
++  transcriptExportFolder: localPath,
+ }).strict();
++/** Settings that name programs to run or folders to write. Only the desktop app itself may change them. */
++export const pathSettings = ['pipelinePython', 'pipelineNemoExe', 'pipelineWorkFolder', 'transcriptExport', 'transcriptExportFolder'] as const;
+ export type AiConfig = z.infer<typeof aiConfigSchema>;
+ export const secretNames = ['mistralApiKey', 'deepgramApiKey', 'openaiApiKey', 'assemblyaiApiKey', 'anthropicApiKey', 'geminiApiKey', 'customApiKey'] as const;
+ export const aiSettingsInput = aiConfigSchema.extend({
+@@ -65,9 +82,14 @@ export function readSettings(database: Database): Record<string, string> {
+ }
+ export function aiConfigFromSettings(values: Record<string, string>): AiConfig {
+   // Legacy engine/key settings remain valid; all new routing is explicit.
+-  const raw = values.aiConfig ? JSON.parse(values.aiConfig) : { transcriptionEngine: values.transcriptionEngine || 'whisper' };
++  // A vault with no transcription setting at all starts on the local pipeline, in English, with speaker labels.
++  // Field defaults stay neutral (automatic language, no speaker labels) so a config that names another engine
++  // never inherits options that engine cannot take.
++  const raw = values.aiConfig ? JSON.parse(values.aiConfig) : values.transcriptionEngine ? { transcriptionEngine: values.transcriptionEngine } : DEFAULT_TRANSCRIPTION;
+   return aiConfigSchema.parse(raw);
+ }
++/** The out-of-the-box transcription setup: faster-whisper large-v3-turbo + Nemotron-3, English, speaker labels. */
++export const DEFAULT_TRANSCRIPTION = { transcriptionEngine: 'local-pipeline', transcriptionLanguage: 'en', transcriptionDiarize: true } as const;
+ export function readAiConfig(database: Database): AiConfig {
+   return aiConfigFromSettings(readSettings(database));
+ }
+@@ -78,7 +100,7 @@ export function credential(database: Database, provider: string): string | undef
+ }
+ /** Whether a provider keeps data on this computer. A custom endpoint is cloud unless it is loopback. */
+ export function isLocalProvider(config: Pick<AiConfig, 'customBaseUrl'>, provider: string): boolean {
+-  if (provider === 'whisper' || provider === 'ollama') return true;
++  if (localSpeechProviders.includes(provider) || provider === 'ollama') return true;
+   if (provider !== 'custom' || !config.customBaseUrl) return false;
+   try { return customEndpoint(config.customBaseUrl).loopback; } catch { return false; }
+ }
+diff --git a/src/ai/pricing.ts b/src/ai/pricing.ts
+index f789ff3..c0dd00e 100644
+--- a/src/ai/pricing.ts
++++ b/src/ai/pricing.ts
+@@ -1,4 +1,5 @@
+ import type { SpeechProvider, TextProvider } from './config';
++import { speechCapabilities } from './capabilities';
+ 
+ /**
+  * Documented list prices used for spending *estimates* (AI-10).
+@@ -16,6 +17,7 @@ export type SpeechPrice = { usdPerMinute: number | null; note?: string };
+ export type TextPrice = { usdPerMillionInput: number; usdPerMillionOutput: number } | null;
+ 
+ export const speechPrices: Record<SpeechProvider, Record<string, SpeechPrice>> = {
++  'local-pipeline': Object.fromEntries(speechCapabilities['local-pipeline'].models.map(model => [model, { usdPerMinute: 0, note: 'Runs on this computer.' }])),
+   whisper: { base: { usdPerMinute: 0, note: 'Runs on this computer.' }, small: { usdPerMinute: 0, note: 'Runs on this computer.' }, medium: { usdPerMinute: 0, note: 'Runs on this computer.' } },
+   mistral: { 'voxtral-mini-latest': { usdPerMinute: 0.001 } },
+   deepgram: { 'nova-2': { usdPerMinute: null, note: 'Plan- and add-on-dependent; not estimated.' }, 'nova-3': { usdPerMinute: null, note: 'Plan- and add-on-dependent; not estimated.' } },
+@@ -40,7 +42,7 @@ export function speechPrice(provider: SpeechProvider, model: string | undefined
+ 
+ /** Estimated USD for `seconds` of audio, or null when the price (or the duration) is unknown. */
+ export function estimateSpeechUsd(provider: SpeechProvider, model: string | undefined | null, seconds: number | null): number | null {
+-  if (provider === 'whisper') return 0;
++  if (speechCapabilities[provider].local) return 0;
+   const price = speechPrice(provider, model).usdPerMinute;
+   if (price === null || seconds === null || !Number.isFinite(seconds) || seconds < 0) return null;
+   return round(price * seconds / 60);
+diff --git a/src/ai/providers.test.ts b/src/ai/providers.test.ts
+index 5e05ffd..3c25e15 100644
+--- a/src/ai/providers.test.ts
++++ b/src/ai/providers.test.ts
+@@ -22,7 +22,27 @@ test('atomic settings reject invalid options, redact keys and enforce local-only
+   expect((await put({ ...config, transcriptionEngine: 'mistral', transcriptionDiarize: true })).status).toBe(400);
+   expect((await put({ ...config, privacyMode: 'local-only', chatProvider: 'openai' })).status).toBe(400);
+   expect((await put({ ...config, credentials: { unknown: 'key' } })).status).toBe(400);
+-  expect(readAiConfig(db).transcriptionEngine).toBe('whisper'); db.close();
++  expect(readAiConfig(db).transcriptionEngine).toBe('local-pipeline'); db.close();
++});
++test('local pipeline and export paths change only from the desktop app', async () => {
++  const db = database(), api = createAiSettingsApi(db), config = aiConfigSchema.parse({});
++  const saved = process.env.OPENPLOD_API_TOKEN; process.env.OPENPLOD_API_TOKEN = 'synthetic-api-token';
++  try {
++    const put = (body: unknown) => api.request('/', { method: 'PUT', headers: { 'Content-Type': 'application/json', 'X-OpenPlod-Token': 'synthetic-api-token' }, body: JSON.stringify(body) });
++    for (const patch of [{ pipelinePython: 'C:\\evil\\python.exe' }, { pipelineNemoExe: 'C:\\evil\\x.exe' }, { pipelineWorkFolder: 'C:\\w' }, { transcriptExportFolder: 'C:\\x' }, { transcriptExport: false }])
++      expect((await put({ ...config, ...patch })).status).toBe(403);
++    // Everything else stays changeable through the API.
++    expect((await put({ ...config, transcriptionLanguage: 'fr' })).status).toBe(200);
++    expect(readAiConfig(db)).toMatchObject({ transcriptionLanguage: 'fr', pipelinePython: '', transcriptExport: true });
++    const body = await (await api.request('/')).json() as { data: { pipelineResolved: { python: string; exportFolder: string } } };
++    expect(body.data.pipelineResolved.exportFolder).toContain('OpenPlodExport');
++  } finally { if (saved === undefined) delete process.env.OPENPLOD_API_TOKEN; else process.env.OPENPLOD_API_TOKEN = saved; db.close(); }
++});
++test('a vault with no transcription setting defaults to the local pipeline; a legacy engine key keeps its old defaults', () => {
++  const empty = database();
++  expect(readAiConfig(empty)).toMatchObject({ transcriptionEngine: 'local-pipeline', transcriptionLanguage: 'en', transcriptionDiarize: true }); empty.close();
++  const legacy = database(); legacy.query('INSERT INTO user_settings(key,value) VALUES(?,?)').run('transcriptionEngine', 'whisper');
++  expect(readAiConfig(legacy)).toMatchObject({ transcriptionEngine: 'whisper', transcriptionLanguage: 'auto', transcriptionDiarize: false }); legacy.close();
+ });
+ test('local-only refuses a configured cloud text provider before calling it', () => {
+   const db = database(); db.query('INSERT INTO user_settings(key,value) VALUES(?,?)').run('aiConfig', JSON.stringify({ privacyMode: 'local-only' }));
+diff --git a/src/ai/transcription-profiles.test.ts b/src/ai/transcription-profiles.test.ts
+index 811c986..e51ed02 100644
+--- a/src/ai/transcription-profiles.test.ts
++++ b/src/ai/transcription-profiles.test.ts
+@@ -120,7 +120,7 @@ describe('Onboarding', () => {
+     db.exec("CREATE TABLE recordings(id TEXT PRIMARY KEY, retention_state TEXT NOT NULL DEFAULT 'active'); INSERT INTO recordings VALUES ('a','active'),('b','trash')");
+     const api = createOnboardingApi(db, () => ({ whisper: false }));
+     const status = async () => ((await (await api.request('/')).json()) as { data: Record<string, unknown> }).data;
+-    expect(await status()).toMatchObject({ completedAt: null, skipped: false, engine: 'whisper', engineLabel: 'Whisper.cpp', engineReady: false, recordings: 1, documents: 0, profiles: 0 });
++    expect(await status()).toMatchObject({ completedAt: null, skipped: false, engine: 'local-pipeline', engineLabel: 'Local pipeline (faster-whisper + Nemotron-3)', engineReady: false, recordings: 1, documents: 0, profiles: 0 });
+     expect((await api.request('/complete', json({ skipped: 'yes' }))).status).toBe(400);
+     expect((await api.request('/complete', json({ skipped: true }))).status).toBe(200);
+     expect(await status()).toMatchObject({ completedAt: expect.any(String), skipped: true });
+diff --git a/src/ai/transcription-profiles.ts b/src/ai/transcription-profiles.ts
+index ba8e853..f00c350 100644
+--- a/src/ai/transcription-profiles.ts
++++ b/src/ai/transcription-profiles.ts
+@@ -170,7 +170,9 @@ export function effectiveTranscription(database: Database, config: AiConfig): Ef
+     ...config, transcriptionEngine: engine,
+     transcriptionModel: profile?.engine ? profile.model ?? '' : engine === config.transcriptionEngine ? config.transcriptionModel : '',
+     transcriptionLanguage: profile?.language ?? config.transcriptionLanguage,
+-    transcriptionDiarize: profile && profile.diarize !== null ? Boolean(profileDiarize) : config.transcriptionDiarize,
++    // A profile that names a provider but leaves speaker labels unset keeps them only where that provider has them.
++    // Options set directly (no profile provider) still fail loudly when unsupported.
++    transcriptionDiarize: profile && profile.diarize !== null ? Boolean(profileDiarize) : profile?.engine ? config.transcriptionDiarize && capabilities.diarization : config.transcriptionDiarize,
+     transcriptionVocabulary: dedupe([...config.transcriptionVocabulary, ...profileVocabulary]),
+     transcriptionPrompt: [config.transcriptionPrompt, profilePromptText].filter(Boolean).join('\n').slice(0, 2000),
+   };
+diff --git a/src/api/ai-settings.ts b/src/api/ai-settings.ts
+index 1622956..56494c0 100644
+--- a/src/api/ai-settings.ts
++++ b/src/api/ai-settings.ts
+@@ -1,8 +1,12 @@
+ import { Hono } from 'hono';
++import { existsSync } from 'node:fs';
+ import { protectSetting } from '../vault/secrets';
+ import { z } from 'zod';
+ import type { Database } from 'bun:sqlite';
+-import { aiSettingsInput, aiConfigSchema, readAiConfig, credential, secretNames, assertPrivacy, textProviders, textModels, customEndpoint, isLocalProvider } from '../ai/config';
++import { aiSettingsInput, aiConfigSchema, readAiConfig, credential, secretNames, assertPrivacy, textProviders, textModels, customEndpoint, isLocalProvider, pathSettings } from '../ai/config';
++import { principalOf } from './access';
++import { exportRoot, pipelineSettingsOf } from '../transcription/pipeline-export';
++import { nemoCandidates, pipelinePython, pipelineWorkRoot } from '../transcription/local-pipeline';
+ import { speechCapabilities } from '../ai/capabilities';
+ import { validateEffective } from '../ai/transcription-profiles';
+ import { installedOllamaModels, ollamaContextLength } from '../ai/text';
+@@ -16,12 +20,21 @@ export function createAiSettingsApi(database: Database, fetcher: typeof fetch =
+     const config = readAiConfig(database);
+     return c.json({ success: true, data: { ...config, credentials: Object.fromEntries(secretNames.map(key => [key, Boolean(credential(database, key.replace('ApiKey', '')))])), capabilities: speechCapabilities,
+       textCapabilities: Object.fromEntries(textProviders.map(provider => [provider, { defaultModel: textModels[provider] || null, local: isLocalProvider(config, provider), requiresKey: !['ollama', 'custom'].includes(provider) }])),
+-      pricing: { pricesAsOf: PRICES_AS_OF, label: PRICE_LABEL, speech: speechPrices, text: textPrices } } });
++      pricing: { pricesAsOf: PRICES_AS_OF, label: PRICE_LABEL, speech: speechPrices, text: textPrices },
++      // What the local pipeline will actually use with the current settings (blank fields resolved).
++      pipelineResolved: (() => { const settings = pipelineSettingsOf(config), python = pipelinePython(settings);
++        return { python, pythonFound: existsSync(python), nemo: nemoCandidates(settings), workFolder: pipelineWorkRoot(settings), exportFolder: exportRoot(config) }; })() } });
+   });
+   app.put('/', async c => {
+     const input = aiSettingsInput.safeParse(await c.req.json().catch(() => null));
+     if (!input.success) return c.json({ success: false, error: input.error.issues.some(issue => issue.path[0] === 'customBaseUrl') ? 'Custom endpoints must use HTTPS (or loopback HTTP) without credentials, query or fragment.' : 'Invalid AI settings.' }, 400);
+     const { credentials, ...config } = input.data;
++    // Paths name programs OpenPlod runs and folders it writes, so only the desktop app itself (its pairing
++    // token over loopback) may change them; a paired phone or an API token can change everything else.
++    const saved = readAiConfig(database), principal = principalOf(c);
++    const changedPaths = pathSettings.filter(key => config[key] !== saved[key]);
++    if (changedPaths.length && principal?.kind !== 'desktop' && principal?.kind !== 'open')
++      return c.json({ success: false, code: 'forbidden', error: 'Local pipeline and export paths can only be changed from the OpenPlod desktop app on this computer.' }, 403);
+     try {
+       assertPrivacy(config, config.transcriptionEngine);
+       for (const provider of config.transcriptionFallback) assertPrivacy(config, provider);
+diff --git a/src/api/recordings.ts b/src/api/recordings.ts
+index fd8320b..27d3694 100644
+--- a/src/api/recordings.ts
++++ b/src/api/recordings.ts
+@@ -15,6 +15,8 @@ import { createHash } from 'node:crypto';
+ import { readAiConfig, readSettings, textSelection } from '../ai/config';
+ import { ComparisonError, listComparisons, queueComparison, type ComparisonRequest } from '../library/provider-compare';
+ import { TranscriptionRouter } from '../transcription/router';
++import { pipelineSettingsOf } from '../transcription/pipeline-export';
++import { speechCapabilities } from '../ai/capabilities';
+ import { extractStructure, proposeCleanup, proposeTranslation, TranscriptAiError } from '../library/transcript-ai';
+ import { isStructureFormat, renderStructure, STRUCTURE_EXTENSION, STRUCTURE_FORMATS, STRUCTURE_MIME, type StructureFormat } from '../library/structure-export';
+ import { StructureStore, StructureStoreError } from '../library/structure-store';
+@@ -343,7 +345,7 @@ app.post('/batch/estimate', async c => {
+   const cost = runnable.length ? estimateRecordings(sqlite, runnable, config) : null;
+   return c.json({ success: true, data: {
+     recordings: ids.length, wouldRun: runnable.length,
+-    usesCloudProvider: provider !== null && provider !== 'whisper',
++    usesCloudProvider: provider !== null && !speechCapabilities[provider].local,
+     provider, estimatedCost: cost,
+   }});
+ });
+@@ -666,7 +668,7 @@ app.get('/:id/transcript/pdf', c => {
+  * result is an independent version that is never promoted automatically.
+  * `GET` reports those runs and which providers could be used.
+  */
+-const engineStatus = () => new TranscriptionRouter({}, readSettings(sqlite)).status();
++const engineStatus = () => new TranscriptionRouter({}, readSettings(sqlite), pipelineSettingsOf(readAiConfig(sqlite))).status();
+ 
+ app.get('/:id/transcript/provider-comparisons', c => {
+   const id = c.req.param('id');
+diff --git a/src/automation/rules.ts b/src/automation/rules.ts
+index 24ef5d5..c6c6205 100644
+--- a/src/automation/rules.ts
++++ b/src/automation/rules.ts
+@@ -199,7 +199,8 @@ export class RuleEngine {
+   private transcribePlan(action: Extract<RuleAction, { type: 'transcribe' }>): { config: AiConfig; engine: AiConfig['transcriptionEngine'] } {
+     const base = readAiConfig(this.database);
+     // Rules use exactly one provider: no silent fallback to another service.
+-    const config: AiConfig = { ...base, transcriptionFallback: [], ...(action.provider ? { transcriptionEngine: action.provider, transcriptionModel: '' } : {}),
++    // A named provider keeps speaker labels only when it can produce them.
++    const config: AiConfig = { ...base, transcriptionFallback: [], ...(action.provider ? { transcriptionEngine: action.provider, transcriptionModel: '', transcriptionDiarize: base.transcriptionDiarize && speechCapabilities[action.provider].diarization } : {}),
+       ...(action.profileId ? { transcriptionProfile: action.profileId } : {}) };
+     return { config, engine: validateEffective(this.database, config).config.transcriptionEngine };
+   }
+diff --git a/src/index.ts b/src/index.ts
+index 06ca217..30e8aea 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -40,12 +40,14 @@ import { createKnowledgeApi } from './api/knowledge';
+ import { RecordingCollections } from './knowledge/collections';
+ import { KnowledgeIndex } from './knowledge/retrieval';
+ import { KnowledgeSuggestions } from './knowledge/suggestions';
+-import { aiConfigSchema, readAiConfig, readSettings, assertPrivacy } from './ai/config';
++import { aiConfigSchema, readAiConfig, readSettings, assertPrivacy, speechProviders, type SpeechProvider } from './ai/config';
++import { speechCapabilities } from './ai/capabilities';
+ import { effectiveTranscription } from './ai/transcription-profiles';
+ import { startAutomation } from './automation';
+ import { emitAutomationEvent } from './automation/hooks';
+ import { runTranscription } from './transcription/job-runner';
+ import { assemblyAiCancelHook } from './transcription/remote-cancel';
++import { decodedOriginal, exportRoot, meetingFolderName, pipelineSettingsOf, recordingStart, writePipelineExport } from './transcription/pipeline-export';
+ import packageInfo from '../package.json';
+ 
+ // ============================================
+@@ -61,8 +63,9 @@ console.log('[DB] Tables ready');
+ // Transcription router
+ // ============================================
+ 
+-const transcriptionRouter = new TranscriptionRouter();
+-const engineStatus = transcriptionRouter.status();
++/** Engine availability with the paths currently saved in AI settings. */
++const currentEngineStatus = () => new TranscriptionRouter({}, {}, pipelineSettingsOf(readAiConfig(sqlite))).status();
++const engineStatus = currentEngineStatus();
+ console.log('[Transcription] Engines:', Object.entries(engineStatus).map(([k, v]) => `${k}:${v ? '✓' : '✗'}`).join(' '));
+ 
+ // ============================================
+@@ -90,13 +93,19 @@ jobQueue.register('process-recording', async (data: any, job) => {
+ 
+   const settings = readSettings(sqlite);
+   const primary = config.transcriptionEngine;
++  // Program and folder paths come only from the saved settings, never from a job's own config.
+   const router = new TranscriptionRouter(
+     { primary, fallback: config.transcriptionFallback, localOnly: currentConfig.privacyMode === 'local-only' || config.privacyMode === 'local-only', beforeAttempt: provider => assertPrivacy(readAiConfig(sqlite), provider) },
+     { mistralApiKey: settings.mistralApiKey, deepgramApiKey: settings.deepgramApiKey, openaiApiKey: settings.openaiApiKey, assemblyaiApiKey: settings.assemblyaiApiKey },
++    pipelineSettingsOf(currentConfig),
+   );
++  // The local pipeline reads the decoded original (the same audio the export ships as audio.ogg) and names its
++  // work folder and RTTM recording id after the recording's start time.
++  const start = recordingStart(recording), meetingName = meetingFolderName(start);
++  const original = primary === 'local-pipeline' ? decodedOriginal(recording) : null;
+   const startedAt = new Date().toISOString();
+   // Cost gate, spend ledger and long-audio chunking (AI-08, AI-10) live in the runner.
+-  const result = await runTranscription(sqlite, router, { jobId: job.id, recordingId, filePath, config, options, costConfirmed: data.costConfirmed === true, signal: job.signal, checkpoint: job.checkpoint, saveCheckpoint: job.saveCheckpoint });
++  const result = await runTranscription(sqlite, router, { jobId: job.id, recordingId, filePath: original ?? filePath, config, options: { ...options, pipelineLabel: meetingName }, costConfirmed: data.costConfirmed === true, signal: job.signal, checkpoint: job.checkpoint, saveCheckpoint: job.saveCheckpoint });
+   job.signal.throwIfAborted();
+ 
+   if (result.success) {
+@@ -113,6 +122,17 @@ jobQueue.register('process-recording', async (data: any, job) => {
+     });
+     void emitAutomationEvent({ type: 'recording.transcribed', recordingId, transcriptVersionId: job.id, provider: result.engine, model: typeof result.metadata?.model === 'string' ? result.metadata.model : null, current: documentUpdated });
+ 
++    // Export folder hand-back: only for local-pipeline runs with speaker labels. A failed export never fails the transcript.
++    const pipeline = result.metadata?.pipeline as { workDir?: string; diarized?: boolean } | undefined;
++    if (result.engine === 'local-pipeline' && pipeline?.workDir && currentConfig.transcriptExport) {
++      if (!pipeline.diarized) console.log(`[Export] Skipped for ${recordingId}: speaker labels were off, so diar.json was not written.`);
++      else try {
++        const folder = await writePipelineExport({ root: exportRoot(currentConfig), name: meetingName, workDir: pipeline.workDir, appVersion: packageInfo.version, start,
++          recording: { id: recording.id, sourceRecordingId: recording.sourceRecordingId ?? null, recordedAt: recording.recordedAt ?? null, uploadedAt: recording.uploadedAt ?? null, durationSeconds: Math.round(result.duration) || recording.durationSeconds || null, filePath: recording.filePath } });
++        console.log(`[Export] ${recordingId} -> ${folder}`);
++      } catch (error) { console.error(`[Export] Failed for ${recordingId}:`, error instanceof Error ? error.message : error); }
++    }
++
+     if (documentUpdated && settings.autoSummarize === 'true') {
+       await db.update(recordings).set({ status: 'summarizing' }).where(eq(recordings.id, recordingId));
+       try {
+@@ -182,7 +202,7 @@ app.get('/api/info', (c) => c.json({
+   name: 'OpenPlod',
+   version: packageInfo.version,
+   status: 'ok',
+-  engines: transcriptionRouter.status(),
++  engines: currentEngineStatus(),
+ }));
+ 
+ // API routes
+@@ -203,7 +223,7 @@ app.route('/api/ai', createRecordingAiApi(new RecordingAi(organizer, undefined,
+   (query, { limit, signal }) => knowledgeIndex.search({ q: query.slice(0, 500), mode: 'hybrid', source: 'transcripts', limit }, { signal }))));
+ app.route('/api/ai-settings', createAiSettingsApi(sqlite));
+ app.route('/api/vault', createVaultApi(sqlite));
+-app.route('/api/onboarding', createOnboardingApi(sqlite, () => new TranscriptionRouter({}, readSettings(sqlite)).status()));
++app.route('/api/onboarding', createOnboardingApi(sqlite, () => new TranscriptionRouter({}, readSettings(sqlite), pipelineSettingsOf(readAiConfig(sqlite))).status()));
+ 
+ // Settings
+ app.get('/api/settings', async (c) => {
+@@ -241,8 +261,8 @@ function saveLegacySettings(entries: [string, unknown][]): string | null {
+   for (const [key, value] of entries) {
+     if (!LEGACY_SETTING_KEYS.has(key)) return 'Unknown setting';
+     if (key === 'transcriptionEngine') {
+-      if (!['whisper', 'mistral', 'deepgram', 'openai', 'assemblyai'].includes(String(value))) return 'Unknown transcription provider.';
+-      if (readAiConfig(sqlite).privacyMode === 'local-only' && value !== 'whisper') return 'Local-only mode blocks cloud transcription.';
++      if (!(speechProviders as readonly string[]).includes(String(value))) return 'Unknown transcription provider.';
++      if (readAiConfig(sqlite).privacyMode === 'local-only' && !speechCapabilities[value as SpeechProvider].local) return 'Local-only mode blocks cloud transcription.';
+     }
+   }
+   sqlite.transaction(() => {
+@@ -250,7 +270,7 @@ function saveLegacySettings(entries: [string, unknown][]): string | null {
+       if (key === 'transcriptionEngine') {
+         const config = readAiConfig(sqlite);
+         config.transcriptionEngine = value as typeof config.transcriptionEngine;
+-        config.transcriptionModel = ''; config.transcriptionDiarize = false; config.transcriptionVocabulary = []; config.transcriptionPrompt = '';
++        config.transcriptionModel = ''; config.transcriptionDiarize = value === 'local-pipeline'; config.transcriptionVocabulary = []; config.transcriptionPrompt = '';
+         upsertSetting('aiConfig', JSON.stringify(config));
+       }
+       upsertSetting(key, protectSetting(key, String(value)));
+diff --git a/src/jobs/submit.test.ts b/src/jobs/submit.test.ts
+index 40a40bb..ec8e857 100644
+--- a/src/jobs/submit.test.ts
++++ b/src/jobs/submit.test.ts
+@@ -13,7 +13,7 @@ const cloud = () => database.query("INSERT INTO user_settings(key,value) VALUES(
+ test('an Idempotency-Key returns the same job on retry and rejects a different request (KB-06)', async () => {
+   const recording = addRecording(database);
+   const first = await submitTranscription(database, queue, { recordingId: recording.id, idempotencyKey: 'retry-1' });
+-  expect(first).toMatchObject({ replayed: false, plan: { provider: 'whisper', local: true, requiresCloudConsent: false } });
++  expect(first).toMatchObject({ replayed: false, plan: { provider: 'local-pipeline', local: true, requiresCloudConsent: false } });
+   const again = await submitTranscription(database, queue, { recordingId: recording.id, idempotencyKey: 'retry-1' });
+   expect(again).toMatchObject({ replayed: true });
+   expect(again.job.id).toBe(first.job.id);
+diff --git a/src/jobs/submit.ts b/src/jobs/submit.ts
+index f42a817..9e7a151 100644
+--- a/src/jobs/submit.ts
++++ b/src/jobs/submit.ts
+@@ -45,7 +45,11 @@ export function planTranscription(database: Database, recordingId: string, reque
+   if (!recording || recording.retentionState !== 'active') fail(404, 'recording_not_found', 'Active recording not found.');
+   let config: AiConfig, engine: AiConfig['transcriptionEngine'], model: string | null, profile: string | null;
+   try {
+-    config = aiConfigSchema.parse({ ...readAiConfig(database), ...overrides });
++    const base = readAiConfig(database), named = (overrides as { transcriptionEngine?: unknown }).transcriptionEngine;
++    // Naming another provider without saying whether to label speakers keeps labels only where that provider has them.
++    const diarize = typeof named === 'string' && named in speechCapabilities && !('transcriptionDiarize' in overrides)
++      ? { transcriptionDiarize: base.transcriptionDiarize && speechCapabilities[named as AiConfig['transcriptionEngine']].diarization } : {};
++    config = aiConfigSchema.parse({ ...base, ...overrides, ...diarize });
+     const resolved = validateEffective(database, config);
+     assertPrivacy(readAiConfig(database), resolved.config.transcriptionEngine);
+     engine = resolved.config.transcriptionEngine; model = resolved.config.transcriptionModel || null; profile = resolved.profile?.name ?? null;
+diff --git a/src/library/provider-compare.test.ts b/src/library/provider-compare.test.ts
+index 81013fd..5ad0533 100644
+--- a/src/library/provider-compare.test.ts
++++ b/src/library/provider-compare.test.ts
+@@ -9,7 +9,7 @@ import {
+ 
+ let database: Database;
+ const recordingId = crypto.randomUUID();
+-const available: Record<SpeechProvider, boolean> = { whisper: false, mistral: true, deepgram: true, openai: false, assemblyai: false };
++const available: Record<SpeechProvider, boolean> = { 'local-pipeline': false, whisper: false, mistral: true, deepgram: true, openai: false, assemblyai: false };
+ const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+ 
+ beforeEach(() => {
+diff --git a/src/text-modules.d.ts b/src/text-modules.d.ts
+new file mode 100644
+index 0000000..4b63d9a
+--- /dev/null
++++ b/src/text-modules.d.ts
+@@ -0,0 +1,5 @@
++/** Files imported with `with { type: 'text' }` are bundled into the server as strings. */
++declare module '*.py' {
++  const text: string;
++  export default text;
++}
+diff --git a/src/transcription/local-pipeline.py b/src/transcription/local-pipeline.py
+new file mode 100644
+index 0000000..185c7bd
+--- /dev/null
++++ b/src/transcription/local-pipeline.py
+@@ -0,0 +1,256 @@
++"""OpenPlod local pipeline: faster-whisper speech to text + Nemotron-3 speaker labels (NeMo-Speech.cpp CLI).
++
++Started by src/transcription/local-pipeline.ts with the pipeline Python (a venv holding faster-whisper and
++soundfile). Everything runs on this computer; Hugging Face is forced offline by the caller, so a model that is
++not cached fails instead of downloading.
++
++  python -I -u local-pipeline.py --audio IN --work DIR [--model large-v3-turbo] [--language en|auto]
++         [--prompt-file FILE] [--diarize 1|0] [--nemo EXE;EXE] [--recording-id NAME] [--marks ms,ms] [--ffmpeg EXE]
++
++Writes into DIR: audio16k.wav, asr.json, diar.rttm, diar.json, transcript.json, transcript.md, timing.txt,
++openplod_segments.json (OpenPlod's own read-back, with word timings), diarize.log.
++stdout lines OpenPlod reads: "STEP <n> <name>", "AUDIO_SEC <seconds>", "[  12.3 min] 140 segments".
++"""
++import argparse, json, os, subprocess, sys, time
++from datetime import datetime
++
++BELOW_NORMAL_PRIORITY_CLASS = 0x4000
++ENGINE_DIAR = "nemotron-3-diarization/v3-offline"
++JOIN_GAP_SEC = 2.0
++
++
++def below_normal():
++    """Below-normal CPU priority; ffmpeg and nemo-speech started from here inherit it."""
++    if os.name == "nt":
++        import ctypes
++        k = ctypes.windll.kernel32
++        k.SetPriorityClass(k.GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS)
++    else:
++        try:
++            os.nice(10)
++        except OSError:
++            pass
++
++
++def now_iso():
++    return datetime.now().astimezone().isoformat(timespec="seconds")
++
++
++def hms(sec):
++    sec = int(sec)
++    return f"{sec // 3600}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
++
++
++def say(line):
++    print(line, flush=True)
++
++
++class Timing:
++    def __init__(self, path):
++        self.path = path
++        with open(path, "w", encoding="utf-8") as f:
++            f.write(f"start {now_iso()}\n")
++
++    def add(self, line):
++        with open(self.path, "a", encoding="utf-8") as f:
++            f.write(line + "\n")
++
++
++def decode(ffmpeg, audio, wav):
++    subprocess.run([ffmpeg, "-v", "error", "-y", "-i", audio, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
++                   check=True, stdin=subprocess.DEVNULL)
++
++
++def asr(wav, model_name, language, prompt):
++    import soundfile as sf
++    from faster_whisper import WhisperModel
++    # float32 samples, not a path: faster-whisper 1.2.1's own decoder breaks on PyAV 19.
++    samples, rate = sf.read(wav, dtype="float32")
++    if rate != 16000:
++        raise RuntimeError(f"expected 16 kHz audio, got {rate}")
++    audio_sec = len(samples) / 16000.0
++    say(f"AUDIO_SEC {audio_sec:.3f}")
++    t0 = time.time()
++    try:
++        model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)
++    except Exception as e:  # model missing from the cache while offline, or a broken install
++        raise RuntimeError(f"could not load faster-whisper model {model_name!r} from the local cache "
++                           f"(downloads are off): {e}") from e
++    segs, _info = model.transcribe(samples, language=language, vad_filter=True, word_timestamps=True, beam_size=5,
++                                   initial_prompt=prompt or None)
++    out = []
++    for s in segs:
++        out.append({"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text.strip(),
++                    "words": [{"start": round(w.start, 3), "end": round(w.end, 3), "word": w.word} for w in (s.words or [])]})
++        say(f"[{s.end / 60:6.1f} min] {len(out)} segments")
++    meta = {"model": model_name, "audio_sec": round(audio_sec, 3), "wall_sec": round(time.time() - t0, 1)}
++    return {"meta": meta, "segments": out}
++
++
++def build_device(exe):
++    low = exe.lower()
++    return "vulkan" if "vulkan" in low else "cpu" if "cpu" in low else "auto"
++
++
++def read_rttm(path):
++    turns = []
++    with open(path, encoding="utf-8") as f:
++        for line in f:
++            p = line.split()
++            if len(p) >= 8 and p[0] == "SPEAKER":
++                start, dur = float(p[3]), float(p[4])
++                turns.append({"start": round(start, 3), "end": round(start + dur, 3), "speaker": p[7]})
++    turns.sort(key=lambda t: t["start"])
++    return turns
++
++
++def diarize(wav, work, exes, recording_id):
++    """Try each nemo-speech build in order (GPU first); the first that writes an RTTM wins."""
++    rttm = os.path.join(work, "diar.rttm")
++    log_path = os.path.join(work, "diarize.log")
++    errors = []
++    for exe in exes:
++        t0 = time.time()
++        with open(log_path, "a", encoding="utf-8") as log:
++            log.write(f"== {now_iso()} {exe}\n")
++            log.flush()
++            rc = subprocess.run([exe, "diarize", wav, "--device", "auto", "--preset", "v3-offline", "--format", "rttm",
++                                 "--recording-id", recording_id, "--output", rttm, "--force"],
++                                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode
++        if rc == 0 and os.path.exists(rttm):
++            turns = read_rttm(rttm)
++            meta = {"engine": ENGINE_DIAR, "exe": exe, "device": build_device(exe),
++                    "speakers": len({t["speaker"] for t in turns}), "turns": len(turns),
++                    "wall_sec": round(time.time() - t0, 1)}
++            return {"meta": meta, "turns": turns}
++        errors.append(f"{exe} exit {rc}")
++        say(f"diarize: {exe} failed (exit {rc}), trying the next build")
++    raise RuntimeError("every nemo-speech build failed: " + "; ".join(errors or ["none found"]))
++
++
++def speaker_for(seg, turns):
++    """Most overlap; else the turn covering the midpoint; else the nearest turn. Never word by word."""
++    if not turns:
++        return None
++    best, best_ov = None, 0.0
++    for t in turns:
++        ov = min(seg["end"], t["end"]) - max(seg["start"], t["start"])
++        if ov > best_ov:
++            best, best_ov = t["speaker"], ov
++    if best is not None:
++        return best
++    mid = (seg["start"] + seg["end"]) / 2
++    for t in turns:
++        if t["start"] <= mid <= t["end"]:
++            return t["speaker"]
++    return min(turns, key=lambda t: min(abs(mid - t["start"]), abs(mid - t["end"])))["speaker"]
++
++
++def merge(asr_out, diar_out, marks_sec, model_name):
++    turns = diar_out["turns"] if diar_out else []
++    utts = []  # with words, for OpenPlod; transcript.json drops them
++    for seg in asr_out["segments"]:
++        if not seg["text"]:
++            continue
++        spk = speaker_for(seg, turns)
++        last = utts[-1] if utts else None
++        if last and last["raw"] == spk and seg["start"] - last["end"] < JOIN_GAP_SEC:
++            last["end"] = seg["end"]
++            last["text"] = (last["text"] + " " + seg["text"]).strip()
++            last["words"].extend(seg["words"])
++        else:
++            utts.append({"raw": spk, "start": seg["start"], "end": seg["end"], "text": seg["text"], "words": list(seg["words"])})
++    names = {}
++    for u in utts:
++        if u["raw"] not in names:
++            names[u["raw"]] = "Speaker " + chr(ord("A") + len(names)) if len(names) < 26 else f"Speaker {len(names) + 1}"
++        u["speaker"] = names[u["raw"]]
++        u["index"] = list(names).index(u["raw"])
++    transcript = {"meta": asr_out["meta"], "marks_sec": marks_sec,
++                  "utterances": [{"speaker": u["speaker"], "start": u["start"], "end": u["end"], "text": u["text"]} for u in utts]}
++    diar_part = f" + {ENGINE_DIAR} speaker labels" if diar_out else " (no speaker labels)"
++    lines = ["# Transcript", "", f"Engine: faster-whisper {model_name}{diar_part} (local).", ""]
++    pending = sorted(marks_sec)
++    for u in utts:
++        while pending and pending[0] < u["end"]:
++            lines += [f"> **HIGHLIGHT pressed at {hms(pending.pop(0))}**", ""]
++        lines += [f"**[{hms(u['start'])}] {u['speaker']}:** {u['text']}", ""]
++    for m in pending:
++        lines += [f"> **HIGHLIGHT pressed at {hms(m)}**", ""]
++    segments = [{"start": u["start"], "end": u["end"], "text": u["text"], "speaker": u["index"] if diar_out else None,
++                 "words": [{"start": w["start"], "end": w["end"], "text": w["word"].strip()} for w in u["words"] if w["word"].strip()]}
++                for u in utts]
++    return transcript, "\n".join(lines).rstrip() + "\n", {"speakers": len(names) if diar_out else None, "segments": segments}
++
++
++def dump(path, obj):
++    tmp = path + ".part"
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(obj, f, ensure_ascii=False, indent=1)
++    os.replace(tmp, path)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--audio", required=True)
++    ap.add_argument("--work", required=True)
++    ap.add_argument("--model", default="large-v3-turbo")
++    ap.add_argument("--language", default="en")
++    ap.add_argument("--prompt-file", default="")
++    ap.add_argument("--diarize", default="1")
++    ap.add_argument("--nemo", default="")
++    ap.add_argument("--recording-id", default="")
++    ap.add_argument("--marks", default="")
++    ap.add_argument("--ffmpeg", default="ffmpeg")
++    a = ap.parse_args()
++    sys.stdout.reconfigure(encoding="utf-8")
++    below_normal()
++    work = os.path.abspath(a.work)
++    os.makedirs(work, exist_ok=True)
++    timing = Timing(os.path.join(work, "timing.txt"))
++    prompt = open(a.prompt_file, encoding="utf-8").read().strip() if a.prompt_file else ""
++    language = None if a.language in ("", "auto") else a.language
++    marks = sorted(int(x) / 1000.0 for x in a.marks.split(",") if x.strip())
++    exes = [x for x in a.nemo.split(";") if x.strip()]
++    want_diar = a.diarize == "1"
++    wav = os.path.join(work, "audio16k.wav")
++    step = "decode"
++    try:
++        say("STEP 1 asr")
++        decode(a.ffmpeg, a.audio, wav)
++        step = "asr"
++        t0 = time.time()
++        asr_out = asr(wav, a.model, language, prompt)
++        dump(os.path.join(work, "asr.json"), asr_out)
++        timing.add(f"asr wall_sec {int(time.time() - t0)}")
++        diar_out = None
++        if want_diar:
++            step = "diarize"
++            say("STEP 2 diarize")
++            t0 = time.time()
++            diar_out = diarize(wav, work, exes, a.recording_id or os.path.basename(work))
++            dump(os.path.join(work, "diar.json"), diar_out)
++            timing.add(f"diarize wall_sec {int(time.time() - t0)}")
++        step = "merge"
++        say("STEP 3 merge")
++        t0 = time.time()
++        transcript, md, own = merge(asr_out, diar_out, marks, a.model)
++        dump(os.path.join(work, "transcript.json"), transcript)
++        with open(os.path.join(work, "transcript.md"), "w", encoding="utf-8") as f:
++            f.write(md)
++        dump(os.path.join(work, "openplod_segments.json"), own)
++        timing.add(f"merge wall_sec {int(time.time() - t0)}")
++        timing.add(f"end {now_iso()}")
++    except BaseException as e:
++        timing.add(f"FAILED {step}")
++        print(f"pipeline failed at {step}: {e}", file=sys.stderr, flush=True)
++        sys.exit(2)
++    finally:
++        try:
++            os.remove(wav)
++        except OSError:
++            pass
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/transcription/local-pipeline.test.ts b/src/transcription/local-pipeline.test.ts
+new file mode 100644
+index 0000000..c2338e2
+--- /dev/null
++++ b/src/transcription/local-pipeline.test.ts
+@@ -0,0 +1,72 @@
++import { afterEach, expect, test } from 'bun:test';
++import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import { nemoCandidates, percentDone, pipelinePrompt, progressLine, LocalPipelineEngine } from './local-pipeline';
++import { speechCapabilities } from '../ai/capabilities';
++import { aiConfigFromSettings, aiConfigSchema, isLocalProvider } from '../ai/config';
++import { estimateSpeechUsd } from '../ai/pricing';
++
++const exe = process.platform === 'win32' ? 'nemo-speech.exe' : 'nemo-speech';
++let dirs: string[] = [];
++afterEach(() => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); dirs = []; });
++const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'openplod-lp-test-')); dirs.push(dir); return dir; };
++const build = (root: string, folder: string) => { const bin = join(root, folder, 'inner', 'bin'); mkdirSync(bin, { recursive: true }); writeFileSync(join(bin, exe), ''); return join(bin, exe); };
++
++test('the local pipeline is the default engine, English, with speaker labels', () => {
++  const config = aiConfigFromSettings({});
++  expect(config.transcriptionEngine).toBe('local-pipeline');
++  expect(config.transcriptionLanguage).toBe('en');
++  expect(config.transcriptionDiarize).toBe(true);
++  expect(config.transcriptExport).toBe(true);
++  expect(speechCapabilities['local-pipeline'].models[0]).toBe('large-v3-turbo');
++});
++
++test('a config naming another engine does not inherit the pipeline defaults', () => {
++  const config = aiConfigSchema.parse({ transcriptionEngine: 'mistral' });
++  expect(config).toMatchObject({ transcriptionLanguage: 'auto', transcriptionDiarize: false });
++  expect(aiConfigFromSettings({ transcriptionEngine: 'whisper' })).toMatchObject({ transcriptionEngine: 'whisper', transcriptionDiarize: false });
++});
++
++test('the local pipeline counts as local: allowed in local-only mode and free', () => {
++  expect(isLocalProvider({ customBaseUrl: '' }, 'local-pipeline')).toBe(true);
++  expect(speechCapabilities['local-pipeline'].local).toBe(true);
++  expect(estimateSpeechUsd('local-pipeline', 'large-v3-turbo', 3600)).toBe(0);
++});
++
++test('nemo-speech builds: setting first, then Vulkan before CPU, newest version first', () => {
++  const root = temp();
++  const cpu = build(root, '0.3.0-cpu'), vulkanOld = build(root, '0.2.0-vulkan'), vulkanNew = build(root, '0.3.0-vulkan');
++  const chosen = join(temp(), exe); writeFileSync(chosen, '');
++  const saved = process.env.NEMO_SPEECH_EXE; delete process.env.NEMO_SPEECH_EXE;
++  try {
++    expect(nemoCandidates({}, root)).toEqual([vulkanNew, vulkanOld, cpu]);
++    expect(nemoCandidates({ nemoExe: chosen }, root)).toEqual([chosen, vulkanNew, vulkanOld, cpu]);
++    expect(nemoCandidates({ nemoExe: join(root, 'missing.exe') }, root)).toEqual([vulkanNew, vulkanOld, cpu]);
++  } finally { if (saved !== undefined) process.env.NEMO_SPEECH_EXE = saved; }
++});
++
++test('progress: step lines, audio length, and percent from the segment end time', () => {
++  const state = { step: 0, audioSec: null as number | null };
++  expect(progressLine('STEP 1 asr', state)).toBe(true);
++  expect(progressLine('AUDIO_SEC 600.000', state)).toBe(false);
++  expect(state).toEqual({ step: 1, audioSec: 600 });
++  expect(progressLine('[   5.0 min] 140 segments', state)).toBe(true);
++  expect(percentDone('[   5.0 min] 140 segments', state)).toBe(50);
++  expect(percentDone('[  12.0 min] 300 segments', state)).toBe(99);
++  progressLine('STEP 2 diarize', state); expect(percentDone('', state)).toBe(0);
++  progressLine('STEP 3 merge', state); expect(percentDone('', state)).toBe(100);
++});
++
++test('the initial prompt is the context prompt, then the vocabulary as a plain list', () => {
++  expect(pipelinePrompt({ prompt: ' Weekly call. ', vocabulary: ['Acme', 'Globex'] })).toBe('Weekly call.\nAcme, Globex');
++  expect(pipelinePrompt({})).toBe('');
++});
++
++test('a missing pipeline Python is reported with an install hint, nothing is run', async () => {
++  const engine = new LocalPipelineEngine({ python: join(temp(), 'no-python.exe'), nemoExe: join(temp(), 'none.exe') });
++  expect(engine.isAvailable()).toBe(false);
++  const result = await engine.transcribeFile(join(temp(), 'audio.ogg'));
++  expect(result.success).toBe(false);
++  expect(result.error).toContain('Pipeline Python not found');
++});
+diff --git a/src/transcription/local-pipeline.ts b/src/transcription/local-pipeline.ts
+new file mode 100644
+index 0000000..6737af0
+--- /dev/null
++++ b/src/transcription/local-pipeline.ts
+@@ -0,0 +1,184 @@
++import { spawn, execFile } from 'node:child_process';
++import { createHash, randomUUID } from 'node:crypto';
++import { existsSync, readdirSync, statSync, createWriteStream } from 'node:fs';
++import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { join } from 'node:path';
++import { constants, homedir, setPriority, tmpdir } from 'node:os';
++import { z } from 'zod';
++import { speechCapabilities } from '../ai/capabilities';
++import type { TranscriptionEngine, TranscriptionOptions, TranscriptionResult } from './types';
++import { transcriptionFailure } from './openai';
++import script from './local-pipeline.py' with { type: 'text' };
++
++/**
++ * Local pipeline engine: faster-whisper large-v3-turbo speech to text, Nemotron-3 speaker labels through the
++ * NeMo-Speech.cpp CLI, merged one speaker per Whisper segment. The Python script is built into the server and
++ * written to the work folder on use. Nothing leaves this computer: Hugging Face is forced offline, so a model
++ * that is not already cached fails with a clear message instead of downloading.
++ *
++ * Paths come from Settings (AI providers -> Local pipeline), then environment variables, then defaults:
++ *   Python       pipelinePython     | PIPELINE_PYTHON   | %LOCALAPPDATA%\plaud-asr\.venv\Scripts\python.exe
++ *   nemo-speech  pipelineNemoExe    | NEMO_SPEECH_EXE   | %LOCALAPPDATA%\nemo-speech\*vulkan*\*\bin, then *cpu*
++ *   work folder  pipelineWorkFolder | PIPELINE_WORK_DIR | %LOCALAPPDATA%\OpenPlodPipeline
++ */
++export interface PipelineSettings { python?: string; nemoExe?: string; workFolder?: string }
++
++const windows = process.platform === 'win32';
++const exeName = windows ? 'nemo-speech.exe' : 'nemo-speech';
++export const localAppData = () => process.env.LOCALAPPDATA || (windows ? join(homedir(), 'AppData', 'Local') : join(homedir(), '.local', 'share'));
++
++export function pipelinePython(settings: PipelineSettings = {}): string {
++  return settings.python || process.env.PIPELINE_PYTHON || join(localAppData(), 'plaud-asr', '.venv', windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python');
++}
++export function pipelineWorkRoot(settings: PipelineSettings = {}): string {
++  return settings.workFolder || process.env.PIPELINE_WORK_DIR || join(localAppData(), 'OpenPlodPipeline');
++}
++
++/** nemo-speech builds in the order to try: the setting, the env var, then Vulkan (GPU) and CPU builds, newest first. */
++export function nemoCandidates(settings: PipelineSettings = {}, root = join(localAppData(), 'nemo-speech')): string[] {
++  const found: string[] = [];
++  if (settings.nemoExe) found.push(settings.nemoExe);
++  if (process.env.NEMO_SPEECH_EXE) found.push(process.env.NEMO_SPEECH_EXE);
++  const dirs = (path: string) => { try { return readdirSync(path).map(name => join(path, name)).filter(item => statSync(item).isDirectory()); } catch { return []; } };
++  const newest = (paths: string[]) => paths.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
++  for (const kind of ['vulkan', 'cpu']) {
++    for (const build of newest(dirs(root).filter(path => path.slice(root.length + 1).toLowerCase().includes(kind)))) {
++      const direct = join(build, 'bin', exeName);
++      if (existsSync(direct)) found.push(direct);
++      for (const inner of newest(dirs(build))) { const exe = join(inner, 'bin', exeName); if (existsSync(exe)) found.push(exe); }
++    }
++  }
++  return [...new Set(found)].filter(path => existsSync(path));
++}
++
++/** The text faster-whisper gets as its initial prompt: the context prompt, then the vocabulary as a plain list. */
++export function pipelinePrompt(options: TranscriptionOptions): string {
++  return [options.prompt?.trim(), options.vocabulary?.length ? options.vocabulary.join(', ') : ''].filter(Boolean).join('\n');
++}
++
++const segmentsSchema = z.object({
++  speakers: z.number().int().nonnegative().nullable(),
++  segments: z.array(z.object({ start: z.number().nonnegative(), end: z.number().nonnegative(), text: z.string(), speaker: z.number().int().nonnegative().nullable(),
++    words: z.array(z.object({ start: z.number(), end: z.number(), text: z.string() })) })),
++});
++const asrMetaSchema = z.object({ meta: z.object({ model: z.string(), audio_sec: z.number().nonnegative(), wall_sec: z.number() }) });
++const diarMetaSchema = z.object({ meta: z.object({ engine: z.string(), exe: z.string(), device: z.string(), speakers: z.number(), turns: z.number(), wall_sec: z.number() }) });
++
++/** Parse one stdout line of the script into a step and percent. */
++export function progressLine(line: string, state: { step: number; audioSec: number | null }): boolean {
++  let match: RegExpMatchArray | null;
++  if ((match = line.match(/^STEP (\d) /))) { state.step = Number(match[1]); return true; }
++  if ((match = line.match(/^AUDIO_SEC ([\d.]+)/))) { state.audioSec = Number(match[1]); return false; }
++  return /^\[\s*[\d.]+ min\] \d+ segments/.test(line);
++}
++export function percentDone(line: string, state: { step: number; audioSec: number | null }): number {
++  if (state.step >= 2) return state.step === 2 ? 0 : 100;
++  const match = line.match(/^\[\s*([\d.]+) min\]/);
++  if (!match || !state.audioSec) return 0;
++  return Math.max(0, Math.min(99, Math.round(Number(match[1]) * 60 / state.audioSec * 100)));
++}
++const STEP_NAMES = ['', 'speech to text', 'speaker labels', 'merge'];
++
++function killTree(pid: number | undefined) {
++  if (!pid) return;
++  if (windows) execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {});
++  else try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
++}
++
++export class LocalPipelineEngine implements TranscriptionEngine {
++  readonly name = 'local-pipeline';
++  constructor(private readonly settings: PipelineSettings = {}) {}
++  isAvailable() { return existsSync(pipelinePython(this.settings)) && nemoCandidates(this.settings).length > 0; }
++  /** Why the engine is unavailable, for error messages. */
++  installHint(): string {
++    const python = pipelinePython(this.settings);
++    if (!existsSync(python)) return `Pipeline Python not found at ${python}. Install faster-whisper in that venv or set its path in AI settings (Local pipeline). See the README.`;
++    return 'NeMo-Speech.cpp (nemo-speech.exe) not found. Unzip it under %LOCALAPPDATA%\\nemo-speech or set its path in AI settings (Local pipeline). See the README.';
++  }
++
++  async transcribeFile(path: string, options: TranscriptionOptions = {}): Promise<TranscriptionResult> {
++    const diarize = options.diarize !== false;
++    const python = pipelinePython(this.settings), nemo = nemoCandidates(this.settings);
++    if (!existsSync(python) || (diarize && !nemo.length)) return transcriptionFailure(this.name, this.installHint());
++    const model = options.model || 'large-v3-turbo';
++    if (!(speechCapabilities['local-pipeline'].models as readonly string[]).includes(model)) return transcriptionFailure(this.name, 'Select a supported faster-whisper model.');
++    const label = (options.pipelineLabel || 'recording').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 80);
++    const root = pipelineWorkRoot(this.settings);
++    let work = '';
++    try {
++      await mkdir(root, { recursive: true });
++      const hash = createHash('sha256').update(script).digest('hex').slice(0, 12);
++      const scriptPath = join(root, `local-pipeline-${hash}.py`);
++      if (!existsSync(scriptPath)) await writeFile(scriptPath, script, { encoding: 'utf8' });
++      work = join(root, `${new Date().toISOString().replace(/[:.]/g, '-')}_${label}_${randomUUID().slice(0, 8)}`);
++      await mkdir(work, { recursive: true });
++      const promptPath = join(work, 'prompt.txt');
++      await writeFile(promptPath, pipelinePrompt(options), { encoding: 'utf8' });
++      const args = ['-I', '-u', scriptPath, '--audio', path, '--work', work, '--model', model, '--language', options.language || 'auto',
++        '--prompt-file', promptPath, '--diarize', diarize ? '1' : '0', '--nemo', nemo.join(';'), '--recording-id', label,
++        ...(options.marksMs?.length ? ['--marks', options.marksMs.join(',')] : [])];
++      const code = await this.run(python, args, work, options);
++      if (code !== 0) {
++        const log = await readFile(join(work, 'pipeline.log'), 'utf8').catch(() => '');
++        const reason = log.split(/\r?\n/).reverse().find(line => line.startsWith('pipeline failed')) || `the pipeline exited with code ${code}`;
++        return transcriptionFailure(this.name, `Local pipeline failed: ${reason}. Log: ${join(work, 'pipeline.log')}`);
++      }
++      const own = segmentsSchema.parse(JSON.parse(await readFile(join(work, 'openplod_segments.json'), 'utf8')));
++      const asr = asrMetaSchema.parse(JSON.parse(await readFile(join(work, 'asr.json'), 'utf8')));
++      const diar = diarize ? diarMetaSchema.parse(JSON.parse(await readFile(join(work, 'diar.json'), 'utf8'))) : null;
++      const segments = own.segments.map(item => ({ start: item.start, end: item.end, text: item.text, confidence: null,
++        ...(item.speaker !== null ? { speaker: item.speaker } : {}), ...(item.words.length ? { words: item.words } : {}) }));
++      const fullText = segments.map(item => item.text).join(' ').trim();
++      return { success: true, engine: this.name, fullText, segments, wordCount: fullText.split(/\s+/).filter(Boolean).length, speakerCount: own.speakers,
++        confidence: null, duration: asr.meta.audio_sec,
++        metadata: { model, usage: null, language: options.language && options.language !== 'auto' ? options.language : null,
++          pipeline: { workDir: work, diarized: Boolean(diar), diarization: diar?.meta.engine ?? null, device: diar?.meta.device ?? null, asrWallSec: asr.meta.wall_sec } } };
++    } catch (error) {
++      options.signal?.throwIfAborted();
++      return transcriptionFailure(this.name, `Local pipeline failed: ${error instanceof Error ? error.message : String(error)}${work ? ` Work folder: ${work}` : ''}`);
++    }
++  }
++
++  /** Run the script at below-normal priority, logging to pipeline.log and reporting step and percent. */
++  private run(python: string, args: string[], work: string, options: TranscriptionOptions): Promise<number> {
++    return new Promise((resolve, reject) => {
++      const child = spawn(python, args, { cwd: work, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
++        env: { ...process.env, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' } });
++      try { if (child.pid) setPriority(child.pid, constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* the script lowers its own priority too */ }
++      const log = createWriteStream(join(work, 'pipeline.log'));
++      const state = { step: 0, audioSec: null as number | null };
++      let lastSaved = 0, lastKey = '', buffer = '', settled = false;
++      const report = (line: string) => {
++        const stepChanged = progressLine(line, state);
++        if (!state.step) return;
++        const percent = percentDone(line, state), key = `${state.step}:${percent}`, now = Date.now();
++        if (key === lastKey || (!stepChanged && now - lastSaved < 5000)) return;
++        lastKey = key; lastSaved = now;
++        options.onCheckpoint?.({ phase: `pipeline step ${state.step} of 3: ${STEP_NAMES[state.step]}`, progress: { done: percent, total: 100 } });
++      };
++      child.stdout.on('data', (chunk: Buffer) => {
++        log.write(chunk); buffer += chunk.toString('utf8');
++        const lines = buffer.split(/\r?\n/); buffer = lines.pop() ?? '';
++        for (const line of lines) report(line);
++      });
++      child.stderr.on('data', (chunk: Buffer) => log.write(chunk));
++      // Time limit: 30 minutes until the audio length is known, then 3x the audio length plus 15 minutes.
++      const started = Date.now();
++      const watchdog = setInterval(() => {
++        const limit = state.audioSec ? state.audioSec * 3000 + 15 * 60000 : 30 * 60000;
++        if (Date.now() - started > limit) { log.write(`\nOpenPlod: time limit reached after ${Math.round((Date.now() - started) / 1000)} s; stopping.\npipeline failed at time limit: stopped by OpenPlod\n`); killTree(child.pid); }
++      }, 10000);
++      const onAbort = () => killTree(child.pid);
++      options.signal?.addEventListener('abort', onAbort, { once: true });
++      const finish = (fn: () => void) => { if (settled) return; settled = true; clearInterval(watchdog); options.signal?.removeEventListener('abort', onAbort); log.end(fn); };
++      child.on('error', error => finish(() => reject(error)));
++      child.on('close', code => finish(() => { if (options.signal?.aborted) reject(options.signal.reason ?? new Error('cancelled')); else resolve(code ?? 1); }));
++    });
++  }
++
++  async transcribeBuffer(buffer: Buffer, _mimetype: string, options?: TranscriptionOptions) {
++    const directory = await mkdtemp(join(tmpdir(), 'openplod-pipeline-input-'));
++    try { const path = join(directory, 'audio'); await writeFile(path, buffer, { mode: 0o600 }); return await this.transcribeFile(path, options); }
++    finally { await rm(directory, { recursive: true, force: true }); }
++  }
++}
+diff --git a/src/transcription/pipeline-export.test.ts b/src/transcription/pipeline-export.test.ts
+new file mode 100644
+index 0000000..5eab03a
+--- /dev/null
++++ b/src/transcription/pipeline-export.test.ts
+@@ -0,0 +1,49 @@
++import { afterEach, expect, test } from 'bun:test';
++import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import { REQUIRED_EXPORT_FILES, meetingFolderName, recordingStart, writePipelineExport } from './pipeline-export';
++
++let dirs: string[] = [];
++afterEach(() => { for (const dir of dirs) rmSync(dir, { recursive: true, force: true }); dirs = []; });
++const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'openplod-export-test-')); dirs.push(dir); return dir; };
++
++test('the start time comes from the Bluetooth session id, not the import time', () => {
++  const start = recordingStart({ sourceRecordingId: 'SERIAL:1794594645', recordedAt: '2026-11-13T19:57:36.729Z' });
++  expect(start?.toISOString()).toBe('2026-11-13T18:30:45.000Z');
++  expect(recordingStart({ sourceRecordingId: null, recordedAt: '2026-11-13T19:57:36.729Z' })?.toISOString()).toBe('2026-11-13T19:57:36.729Z');
++  expect(recordingStart({ sourceRecordingId: 'upload-abc', recordedAt: null, uploadedAt: null })).toBeNull();
++});
++
++test('folder names use local clock time', () => {
++  expect(meetingFolderName(new Date(2026, 10, 13, 10, 30, 45))).toBe('2026-11-13_1030_meeting');
++  expect(meetingFolderName(new Date(2026, 0, 2, 3, 4))).toBe('2026-01-02_0304_meeting');
++});
++
++function fixture() {
++  const vault = temp(), work = temp(), id = crypto.randomUUID();
++  for (const file of REQUIRED_EXPORT_FILES) writeFileSync(join(work, file), file);
++  const originals = join(vault, 'originals', id); mkdirSync(originals, { recursive: true });
++  writeFileSync(join(originals, 'decoded-original.ogg'), 'ogg');
++  writeFileSync(join(vault, `${id}.m4a`), 'm4a');
++  return { work, recording: { id, sourceRecordingId: 'S:1794594645', recordedAt: null, durationSeconds: 81, filePath: join(vault, `${id}.m4a`) } };
++}
++
++test('an export is complete when it appears, carries audio.ogg and openplod.json, and never overwrites', async () => {
++  const root = temp(), { work, recording } = fixture(), start = new Date(1794594645000);
++  const first = await writePipelineExport({ root, name: '2026-11-13_1030_meeting', workDir: work, recording, appVersion: '1.1.6', start });
++  expect(first).toBe(join(root, '2026-11-13_1030_meeting'));
++  expect(readdirSync(first).sort()).toEqual([...REQUIRED_EXPORT_FILES, 'audio.ogg', 'openplod.json'].sort());
++  expect(readFileSync(join(first, 'audio.ogg'), 'utf8')).toBe('ogg');
++  expect(JSON.parse(readFileSync(join(first, 'openplod.json'), 'utf8'))).toEqual({ recording_id: recording.id, source_recording_id: 'S:1794594645', recorded_at: '2026-11-13T18:30:45.000Z', duration_seconds: 81, app_version: '1.1.6' });
++  const second = await writePipelineExport({ root, name: '2026-11-13_1030_meeting', workDir: work, recording, appVersion: '1.1.6', start });
++  expect(second).toBe(join(root, '2026-11-13_1030_meeting_2'));
++  expect(readdirSync(root).filter(name => name.startsWith('.tmp-'))).toEqual([]);
++});
++
++test('a run without speaker labels is not exported and leaves nothing behind', async () => {
++  const root = temp(), { work, recording } = fixture();
++  rmSync(join(work, 'diar.json'));
++  await expect(writePipelineExport({ root, name: 'x_meeting', workDir: work, recording, appVersion: '1', start: null })).rejects.toThrow('diar.json');
++  expect(existsSync(join(root, 'x_meeting'))).toBe(false);
++});
+diff --git a/src/transcription/pipeline-export.ts b/src/transcription/pipeline-export.ts
+new file mode 100644
+index 0000000..7573dbe
+--- /dev/null
++++ b/src/transcription/pipeline-export.ts
+@@ -0,0 +1,86 @@
++import { randomUUID } from 'node:crypto';
++import { existsSync } from 'node:fs';
++import { copyFile, mkdir, rename, rm, writeFile } from 'node:fs/promises';
++import { dirname, extname, join } from 'node:path';
++import type { AiConfig } from '../ai/config';
++import { localAppData, type PipelineSettings } from './local-pipeline';
++
++/**
++ * Export folder for the local pipeline (hand-back to other tools that read the pipeline's files).
++ *
++ *   <export root>\YYYY-MM-DD_HHMM_meeting\   (local clock time the recording started; _2, _3 ... when taken)
++ *     audio.ogg asr.json diar.json diar.rttm transcript.json transcript.md timing.txt openplod.json
++ *
++ * Files are copied into a hidden temporary folder inside the export root and renamed into place at the end,
++ * so a folder carrying the final name is always complete. An existing folder is never overwritten.
++ */
++export const REQUIRED_EXPORT_FILES = ['asr.json', 'diar.json', 'diar.rttm', 'transcript.json', 'transcript.md', 'timing.txt'] as const;
++
++export function pipelineSettingsOf(config: Pick<AiConfig, 'pipelinePython' | 'pipelineNemoExe' | 'pipelineWorkFolder'>): PipelineSettings {
++  return { python: config.pipelinePython || undefined, nemoExe: config.pipelineNemoExe || undefined, workFolder: config.pipelineWorkFolder || undefined };
++}
++export function exportRoot(config: Pick<AiConfig, 'transcriptExportFolder'>): string {
++  return config.transcriptExportFolder || process.env.OPENPLOD_EXPORT_DIR || join(localAppData(), 'OpenPlodExport');
++}
++
++export interface ExportRecording { id: string; sourceRecordingId: string | null; recordedAt: string | null; uploadedAt?: string | null; durationSeconds: number | null; filePath: string }
++
++/**
++ * When the recording started. A recording read from the recorder over Bluetooth has the source id
++ * `<serial>:<session id>`, and the session id is the start time in Unix seconds. recorded_at holds the
++ * import time for those, so it is only the fallback.
++ */
++export function recordingStart(recording: Pick<ExportRecording, 'sourceRecordingId' | 'recordedAt' | 'uploadedAt'>): Date | null {
++  const session = recording.sourceRecordingId?.match(/:(\d{9,10})$/)?.[1];
++  if (session) {
++    const date = new Date(Number(session) * 1000);
++    if (date.getUTCFullYear() >= 2015 && date.getUTCFullYear() <= 2100) return date;
++  }
++  for (const value of [recording.recordedAt, recording.uploadedAt]) {
++    const date = value ? new Date(value) : null;
++    if (date && !Number.isNaN(date.getTime()) && date.getTime() > 0) return date;
++  }
++  return null;
++}
++
++const pad = (value: number) => String(value).padStart(2, '0');
++/** `YYYY-MM-DD_HHMM_meeting` in this computer's local time. */
++export function meetingFolderName(start: Date | null): string {
++  const date = start ?? new Date();
++  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}_meeting`;
++}
++
++/** The decoded original next to the vault copy (recordings/originals/<id>/decoded-original.ogg), when present. */
++export function decodedOriginal(recording: Pick<ExportRecording, 'id' | 'filePath'>): string | null {
++  const path = join(dirname(recording.filePath), 'originals', recording.id, 'decoded-original.ogg');
++  return existsSync(path) ? path : null;
++}
++
++export async function writePipelineExport(input: { root: string; name: string; workDir: string; recording: ExportRecording; appVersion: string; start: Date | null }): Promise<string> {
++  const missing = REQUIRED_EXPORT_FILES.filter(file => !existsSync(join(input.workDir, file)));
++  if (missing.length) throw new Error(`the pipeline did not write ${missing.join(', ')} (speaker labels off?)`);
++  await mkdir(input.root, { recursive: true });
++  const temp = join(input.root, `.tmp-${input.name}-${randomUUID().slice(0, 8)}`);
++  await mkdir(temp);
++  try {
++    for (const file of REQUIRED_EXPORT_FILES) await copyFile(join(input.workDir, file), join(temp, file));
++    const original = decodedOriginal(input.recording);
++    const audio = original ?? input.recording.filePath;
++    await copyFile(audio, join(temp, original ? 'audio.ogg' : `audio${extname(audio) || '.m4a'}`));
++    await writeFile(join(temp, 'openplod.json'), JSON.stringify({
++      recording_id: input.recording.id, source_recording_id: input.recording.sourceRecordingId,
++      recorded_at: input.start ? input.start.toISOString() : input.recording.recordedAt, duration_seconds: input.recording.durationSeconds,
++      app_version: input.appVersion,
++    }, null, 1), 'utf8');
++    for (let index = 1; index < 1000; index++) {
++      const final = join(input.root, index === 1 ? input.name : `${input.name}_${index}`);
++      if (existsSync(final)) continue;
++      try { await rename(temp, final); return final; }
++      catch (error) { if (!existsSync(final)) throw error; /* taken in the meantime: try the next name */ }
++    }
++    throw new Error(`no free folder name for ${input.name}`);
++  } catch (error) {
++    await rm(temp, { recursive: true, force: true });
++    throw error;
++  }
++}
+diff --git a/src/transcription/router.ts b/src/transcription/router.ts
+index 3c0d810..43da628 100644
+--- a/src/transcription/router.ts
++++ b/src/transcription/router.ts
+@@ -4,7 +4,8 @@ import { MistralEngine } from './mistral';
+ import { DeepgramEngine } from './deepgram';
+ import { OpenAiEngine, transcriptionFailure } from './openai';
+ import { AssemblyAiEngine } from './assemblyai';
+-import { validateSpeechOptions } from '../ai/capabilities';
++import { LocalPipelineEngine, type PipelineSettings } from './local-pipeline';
++import { speechCapabilities, validateSpeechOptions } from '../ai/capabilities';
+ import type { SpeechProvider } from '../ai/config';
+ 
+ export type EngineName = SpeechProvider;
+@@ -13,10 +14,10 @@ export interface ProviderCredentials { mistralApiKey?: string; deepgramApiKey?:
+ export class TranscriptionRouter {
+   private engines: Map<EngineName, TranscriptionEngine>;
+   private config: RouterConfig;
+-  constructor(config?: Partial<RouterConfig>, credentials: ProviderCredentials = {}) {
+-    this.config = { primary: 'whisper', fallback: [], ...config };
++  constructor(config?: Partial<RouterConfig>, credentials: ProviderCredentials = {}, pipeline: PipelineSettings = {}) {
++    this.config = { primary: 'local-pipeline', fallback: [], ...config };
+     this.engines = new Map<EngineName, TranscriptionEngine>([
+-      ['whisper', new WhisperEngine()], ['mistral', new MistralEngine(credentials.mistralApiKey)], ['deepgram', new DeepgramEngine(credentials.deepgramApiKey)],
++      ['local-pipeline', new LocalPipelineEngine(pipeline)], ['whisper', new WhisperEngine()], ['mistral', new MistralEngine(credentials.mistralApiKey)], ['deepgram', new DeepgramEngine(credentials.deepgramApiKey)],
+       ['openai', new OpenAiEngine(credentials.openaiApiKey)], ['assemblyai', new AssemblyAiEngine(credentials.assemblyaiApiKey)],
+     ]);
+   }
+@@ -32,9 +33,9 @@ export class TranscriptionRouter {
+     for (const [index, name] of [...new Set([this.config.primary, ...this.config.fallback])].entries()) {
+       options?.signal?.throwIfAborted();
+       this.config.beforeAttempt?.(name);
+-      if (this.config.localOnly && name !== 'whisper') return transcriptionFailure('router', 'Local-only mode blocks cloud transcription. Select Whisper.cpp.');
++      if (this.config.localOnly && !speechCapabilities[name].local) return transcriptionFailure('router', 'Local-only mode blocks cloud transcription. Select the local pipeline or Whisper.cpp.');
+       const engine = this.engines.get(name);
+-      if (!engine?.isAvailable()) { errors.push(`${name}: not configured`); continue; }
++      if (!engine?.isAvailable()) { errors.push(engine instanceof LocalPipelineEngine ? `${name}: ${engine.installHint()}` : `${name}: not configured`); continue; }
+       // Model identifiers and remote job IDs never cross provider boundaries.
+       const opts = { ...this.config.defaults, ...options, ...(index ? { model: undefined, checkpoint: undefined } : {}) };
+       if (opts.language === 'auto') opts.language = undefined;
+diff --git a/src/transcription/types.ts b/src/transcription/types.ts
+index 1d255dc..4dc14c0 100644
+--- a/src/transcription/types.ts
++++ b/src/transcription/types.ts
+@@ -50,7 +50,11 @@ export interface TranscriptionOptions {
+   prompt?: string;
+   signal?: AbortSignal;
+   checkpoint?: { phase: string; remoteId?: string };
+-  onCheckpoint?: (checkpoint: { phase: string; remoteId?: string }) => void;
++  onCheckpoint?: (checkpoint: { phase: string; remoteId?: string; progress?: { done: number; total: number } }) => void;
++  /** Local pipeline: the name used for the work folder and the RTTM recording id (YYYY-MM-DD_HHMM_meeting). */
++  pipelineLabel?: string;
++  /** Local pipeline: recorder highlight marks in milliseconds from the start. */
++  marksMs?: number[];
+ }
+ 
+ export interface TranscriptionEngine {
+diff --git a/web/src/components/AiSettingsPanel.tsx b/web/src/components/AiSettingsPanel.tsx
+index b90032a..4458519 100644
+--- a/web/src/components/AiSettingsPanel.tsx
++++ b/web/src/components/AiSettingsPanel.tsx
+@@ -7,9 +7,9 @@ import { Input } from '@/components/ui/input'
+ import { Button } from '@/components/ui/button'
+ import { Save, RefreshCw, X, Loader2 } from '@/components/icons'
+ 
+-const speech: SpeechProvider[] = ['whisper', 'mistral', 'deepgram', 'openai', 'assemblyai']
++const speech: SpeechProvider[] = ['local-pipeline', 'whisper', 'mistral', 'deepgram', 'openai', 'assemblyai']
+ const text: TextProvider[] = ['mistral', 'openai', 'anthropic', 'gemini', 'ollama', 'custom']
+-const labels: Record<string, string> = { whisper: 'Whisper.cpp', mistral: 'Mistral', deepgram: 'Deepgram', openai: 'OpenAI', assemblyai: 'AssemblyAI', anthropic: 'Anthropic', ollama: 'Ollama', gemini: 'Gemini', custom: 'Custom endpoint' }
++const labels: Record<string, string> = { 'local-pipeline': 'Local pipeline (faster-whisper + Nemotron-3)', whisper: 'Whisper.cpp', mistral: 'Mistral', deepgram: 'Deepgram', openai: 'OpenAI', assemblyai: 'AssemblyAI', anthropic: 'Anthropic', ollama: 'Ollama', gemini: 'Gemini', custom: 'Custom endpoint' }
+ const providerName = (provider: string) => provider === 'custom' ? t('Custom endpoint') : labels[provider]
+ const tasks = ['analysis', 'document', 'chat'] as const
+ const selectClass = 'h-10 w-full min-w-0 rounded-md border bg-background px-3 text-sm'
+@@ -48,24 +48,34 @@ export function AiSettingsPanel() {
+   const customLocal = customEndpointIsLocal(settings.customBaseUrl)
+   const isLocalText = (provider: TextProvider) => provider === 'ollama' || (provider === 'custom' && customLocal)
+   const textUsed = tasks.flatMap(task => [settings[`${task}Provider`], ...settings[`${task}Fallback`].map(entry => entry.provider)])
+-  const used = [...new Set([settings.transcriptionEngine, ...settings.transcriptionFallback, ...textUsed])].filter(provider => !['whisper', 'ollama'].includes(provider))
++  const used = [...new Set([settings.transcriptionEngine, ...settings.transcriptionFallback, ...textUsed])].filter(provider => !['local-pipeline', 'whisper', 'ollama'].includes(provider))
++  const localSpeech = (provider: SpeechProvider) => settings.capabilities[provider].local
++  const resolved = settings.pipelineResolved
+   const languages = languagesFor(settings, settings.transcriptionEngine, settings.transcriptionModel)
+   const languageOptions = languages.some(([code]) => code === settings.transcriptionLanguage) ? languages : [...languages, [settings.transcriptionLanguage, t('{language} (not documented for this model)', { language: languageLabel(settings.transcriptionLanguage) })] as [string, string]]
+   return <section className="border-t pt-5 space-y-5" aria-label={t('AI providers')}>
+     <div className="flex items-center justify-between gap-3"><h2 className="text-base font-semibold">{t('AI providers')}</h2><Button disabled={busy} onClick={save}>{busy ? <Loader2 className="animate-spin" /> : <Save />}{t('Save AI')}</Button></div>
+     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}{notice && <p role="status" className="text-sm">{notice}</p>}
+-    <label className="grid gap-2 text-sm">{t('Processing privacy')}<select className={selectClass} disabled={busy} value={settings.privacyMode} onChange={e => update(e.target.value === 'local-only' ? { privacyMode: 'local-only', transcriptionEngine: 'whisper', transcriptionModel: '', transcriptionDiarize: false, transcriptionVocabulary: [], transcriptionFallback: [], analysisProvider: 'ollama', analysisModel: '', documentProvider: 'ollama', documentModel: '', chatProvider: 'ollama', chatModel: '', analysisFallback: [], documentFallback: [], chatFallback: [] } : { privacyMode: 'selected-providers' })}><option value="selected-providers">{t('Selected providers')}</option><option value="local-only">{t('Local only')}</option></select></label>
++    <label className="grid gap-2 text-sm">{t('Processing privacy')}<select className={selectClass} disabled={busy} value={settings.privacyMode} onChange={e => update(e.target.value === 'local-only' ? { privacyMode: 'local-only', transcriptionEngine: 'local-pipeline', transcriptionModel: '', transcriptionDiarize: true, transcriptionVocabulary: [], transcriptionFallback: [], analysisProvider: 'ollama', analysisModel: '', documentProvider: 'ollama', documentModel: '', chatProvider: 'ollama', chatModel: '', analysisFallback: [], documentFallback: [], chatFallback: [] } : { privacyMode: 'selected-providers' })}><option value="selected-providers">{t('Selected providers')}</option><option value="local-only">{t('Local only')}</option></select></label>
+     <fieldset disabled={busy} className="grid min-w-0 gap-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Transcription')}</legend>
+-      <label className="grid gap-2 text-sm">{t('Provider')}<select className={selectClass} value={settings.transcriptionEngine} onChange={e => update({ transcriptionEngine: e.target.value as SpeechProvider, transcriptionModel: '', transcriptionDiarize: false, transcriptionVocabulary: [], transcriptionFallback: [], ...(settings.capabilities[e.target.value as SpeechProvider].prompt ? {} : { transcriptionPrompt: '' }) })}>{speech.map(provider => <option key={provider} disabled={local && provider !== 'whisper'} value={provider}>{labels[provider]}</option>)}</select></label>
++      <label className="grid gap-2 text-sm">{t('Provider')}<select className={selectClass} value={settings.transcriptionEngine} onChange={e => update({ transcriptionEngine: e.target.value as SpeechProvider, transcriptionModel: '', transcriptionDiarize: e.target.value === 'local-pipeline', transcriptionVocabulary: [], transcriptionFallback: [], ...(settings.capabilities[e.target.value as SpeechProvider].prompt ? {} : { transcriptionPrompt: '' }) })}>{speech.map(provider => <option key={provider} disabled={local && !localSpeech(provider)} value={provider}>{labels[provider]}</option>)}</select></label>
+       <label className="grid gap-2 text-sm">{t('Model')}<select className={selectClass} value={settings.transcriptionModel} onChange={e => update({ transcriptionModel: e.target.value })}><option value="">{t('{model} (default)', { model: capability.models[0] })}</option>{capability.models.map(model => <option key={model}>{model}</option>)}</select></label>
+       <label className="grid gap-2 text-sm">{t('Language')}<select className={selectClass} value={settings.transcriptionLanguage} onChange={e => update({ transcriptionLanguage: e.target.value })}>{languageOptions.map(([code, label]) => <option key={code} value={code}>{label}</option>)}</select></label>
+       <label className="flex items-center gap-2 text-sm"><input type="checkbox" disabled={!capability.diarization} checked={settings.transcriptionDiarize} onChange={e => update({ transcriptionDiarize: e.target.checked })} />{t('Speaker labels')}</label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Vocabulary hints')}<Input disabled={!capability.vocabulary} value={vocabulary} onChange={e => { setVocabulary(e.target.value); setNotice('') }} /></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Default profile')}<select className={selectClass} value={settings.transcriptionProfile} onChange={e => update({ transcriptionProfile: e.target.value })}><option value="">{t('None')}</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}{settings.transcriptionProfile && !profiles.some(profile => profile.id === settings.transcriptionProfile) && <option value={settings.transcriptionProfile}>{t('Missing profile')}</option>}</select></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Context prompt')}<textarea className="min-h-20 w-full rounded-md border bg-background px-3 py-2 text-sm" disabled={!capability.prompt} maxLength={PROMPT_LIMIT} rows={3} value={capability.prompt ? settings.transcriptionPrompt : ''} placeholder={capability.prompt ? t('Describe your usual recordings: who speaks, the topic, names to spell.') : t('{provider} does not accept a context prompt.', { provider: capability.label })} onChange={e => update({ transcriptionPrompt: e.target.value })} /></label>
+-      <label className="grid gap-2 text-sm sm:col-span-2">{t('Fallback provider')}<select className={selectClass} value={settings.transcriptionFallback[0] || ''} onChange={e => update({ transcriptionFallback: e.target.value ? [e.target.value as SpeechProvider] : [] })}><option value="">{t('None')}</option>{speech.filter(provider => provider !== settings.transcriptionEngine).map(provider => <option key={provider} disabled={local && provider !== 'whisper'} value={provider}>{labels[provider]}</option>)}</select></label>
++      <label className="grid gap-2 text-sm sm:col-span-2">{t('Fallback provider')}<select className={selectClass} value={settings.transcriptionFallback[0] || ''} onChange={e => update({ transcriptionFallback: e.target.value ? [e.target.value as SpeechProvider] : [] })}><option value="">{t('None')}</option>{speech.filter(provider => provider !== settings.transcriptionEngine).map(provider => <option key={provider} disabled={local && !localSpeech(provider)} value={provider}>{labels[provider]}</option>)}</select></label>
+       <label className="grid gap-2 text-sm sm:col-span-2">{t('Split recordings longer than (minutes, 0 = only when a provider size limit requires it)')}<Input type="number" min={0} max={1440} step={1} value={settings.transcriptionChunkAboveMinutes} onChange={e => update({ transcriptionChunkAboveMinutes: Math.max(0, Math.min(1440, Math.round(Number(e.target.value) || 0))) })} /></label>
+     </fieldset>
++    <fieldset disabled={busy} className="grid min-w-0 gap-4 border-t pt-4 sm:grid-cols-2"><legend className="mb-3 text-sm font-semibold">{t('Local pipeline')}</legend>
++      <p className="text-xs text-muted-foreground sm:col-span-2">{t('faster-whisper speech to text with Nemotron-3 speaker labels, run on this computer at below-normal priority. Leave a field empty to use the default shown. Only the desktop app can change these paths.')}</p>
++      <label className="grid gap-2 text-sm sm:col-span-2">{t('Pipeline Python (venv with faster-whisper)')}<Input value={settings.pipelinePython} placeholder={resolved.python} onChange={e => update({ pipelinePython: e.target.value })} /><span className="text-xs text-muted-foreground">{resolved.pythonFound ? t('Found.') : t('Not found at {path}.', { path: resolved.python })}</span></label>
++      <label className="grid gap-2 text-sm sm:col-span-2">{t('nemo-speech.exe (speaker labels)')}<Input value={settings.pipelineNemoExe} placeholder={resolved.nemo[0] ?? t('Detect automatically: Vulkan build first, then CPU')} onChange={e => update({ pipelineNemoExe: e.target.value })} /><span className="text-xs text-muted-foreground">{resolved.nemo.length ? tn(resolved.nemo.length, '{count} build found; the next one is tried if one fails.', '{count} builds found; the next one is tried if one fails.') : t('No nemo-speech build found.')}</span></label>
++      <label className="grid gap-2 text-sm sm:col-span-2">{t('Work folder')}<Input value={settings.pipelineWorkFolder} placeholder={resolved.workFolder} onChange={e => update({ pipelineWorkFolder: e.target.value })} /></label>
++      <label className="flex items-center gap-2 text-sm sm:col-span-2"><input type="checkbox" checked={settings.transcriptExport} onChange={e => update({ transcriptExport: e.target.checked })} />{t('After each local-pipeline transcript, copy its files to the export folder')}</label>
++      <label className="grid gap-2 text-sm sm:col-span-2">{t('Export folder')}<Input disabled={!settings.transcriptExport} value={settings.transcriptExportFolder} placeholder={resolved.exportFolder} onChange={e => update({ transcriptExportFolder: e.target.value })} /><span className="text-xs text-muted-foreground">{t('One folder per recording, named YYYY-MM-DD_HHMM_meeting from its start time. Needs speaker labels on.')}</span></label>
++    </fieldset>
+     <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Text AI')}</legend>{tasks.map(task => {
+       const provider = settings[`${task}Provider`], model = settings[`${task}Model`], fallback = settings[`${task}Fallback`][0]?.provider ?? ''
+       return <div key={task} className="grid gap-3 sm:grid-cols-3">
+@@ -84,6 +94,6 @@ export function AiSettingsPanel() {
+       <p className="text-xs text-muted-foreground sm:col-span-2">{spend ? `${t('Estimated this month ({month}, UTC): {amount}', { month: spend.month, amount: formatUsd(spend.estimatedUsd) })}${spend.unknownEntries ? tn(spend.unknownEntries, ', plus {count} job with unknown cost', ', plus {count} jobs with unknown cost') : ''}${spend.budgetUsd !== null ? t('; {remaining} of {budget} left', { remaining: formatUsd(spend.remainingUsd), budget: formatUsd(spend.budgetUsd) }) : ''}. ` : ''}{settings.pricing.label} {t('Prices as of {date}. Jobs over the budget or threshold need your confirmation; providers do not enforce this limit.', { date: settings.pricing.pricesAsOf })}</p>
+     </fieldset>
+     {used.length > 0 && <fieldset disabled={busy} className="space-y-4 border-t pt-4"><legend className="text-sm font-semibold">{t('Credentials')}</legend>{used.map(provider => <div key={provider} className="flex items-end gap-2"><label className="grid flex-1 gap-2 text-sm">{provider === 'custom' ? t('{provider} API key (optional)', { provider: providerName(provider) }) : t('{provider} API key', { provider: labels[provider] })}<Input type="password" autoComplete="off" value={keys[`${provider}ApiKey`] || ''} placeholder={settings.credentials[`${provider}ApiKey`] ? t('Saved key') : t('Not configured')} onChange={e => setKeys(value => ({ ...value, [`${provider}ApiKey`]: e.target.value }))} /></label><Button variant="outline" disabled={Object.keys(keys).length > 0} onClick={() => action(async () => { await aiSettingsApi.check(provider); setNotice(t('{provider} connection verified', { provider: providerName(provider) })) })}>{t('Check')}</Button></div>)}</fieldset>}
+-    <details className="border-t pt-4"><summary className="cursor-pointer text-sm">{t('Processing jobs')}</summary><Button variant="ghost" className="my-2" onClick={() => action(async () => setJobs(await aiSettingsApi.jobs()))}><RefreshCw />{t('Refresh')}</Button><ul className="divide-y">{jobs.slice().reverse().map(job => <li key={job.id} className="flex items-center gap-2 py-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate">{(job.provider ? providerName(job.provider) : '') || t('Processing')} / {jobStatusLabel(job.status)}{job.checkpoint?.progress ? ` / ${t('chunk {done} of {total}', { done: Math.min(job.checkpoint.progress.done + (job.status === 'running' ? 1 : 0), job.checkpoint.progress.total), total: job.checkpoint.progress.total })}` : ''}</p><p className="break-words text-xs text-muted-foreground">{job.error || job.checkpoint?.phase || job.recordingId}</p></div>{['running', 'pending'].includes(job.status) && <Button variant="ghost" size="icon" title={t('Cancel processing')} onClick={() => action(async () => { await aiSettingsApi.cancel(job.id); setJobs(await aiSettingsApi.jobs()) })}><X /></Button>}{(job.checkpoint?.remoteId || job.checkpoint?.inFlight === false) && ['failed', 'cancelled'].includes(job.status) && <Button variant="outline" onClick={() => action(async () => { await aiSettingsApi.resume(job.id); setJobs(await aiSettingsApi.jobs()) })}>{t('Resume')}</Button>}</li>)}</ul></details>
++    <details className="border-t pt-4"><summary className="cursor-pointer text-sm">{t('Processing jobs')}</summary><Button variant="ghost" className="my-2" onClick={() => action(async () => setJobs(await aiSettingsApi.jobs()))}><RefreshCw />{t('Refresh')}</Button><ul className="divide-y">{jobs.slice().reverse().map(job => <li key={job.id} className="flex items-center gap-2 py-3 text-sm"><div className="min-w-0 flex-1"><p className="truncate">{(job.provider ? providerName(job.provider) : '') || t('Processing')} / {jobStatusLabel(job.status)}{job.checkpoint?.progress && job.checkpoint.phase.startsWith('pipeline') ? ` / ${job.checkpoint.progress.done}%` : job.checkpoint?.progress ? ` / ${t('chunk {done} of {total}', { done: Math.min(job.checkpoint.progress.done + (job.status === 'running' ? 1 : 0), job.checkpoint.progress.total), total: job.checkpoint.progress.total })}` : ''}</p><p className="break-words text-xs text-muted-foreground">{job.error || job.checkpoint?.phase || job.recordingId}</p></div>{['running', 'pending'].includes(job.status) && <Button variant="ghost" size="icon" title={t('Cancel processing')} onClick={() => action(async () => { await aiSettingsApi.cancel(job.id); setJobs(await aiSettingsApi.jobs()) })}><X /></Button>}{(job.checkpoint?.remoteId || job.checkpoint?.inFlight === false) && ['failed', 'cancelled'].includes(job.status) && <Button variant="outline" onClick={() => action(async () => { await aiSettingsApi.resume(job.id); setJobs(await aiSettingsApi.jobs()) })}>{t('Resume')}</Button>}</li>)}</ul></details>
+   </section>
+ }
+diff --git a/web/src/components/Onboarding.tsx b/web/src/components/Onboarding.tsx
+index d79b573..d452099 100644
+--- a/web/src/components/Onboarding.tsx
++++ b/web/src/components/Onboarding.tsx
+@@ -11,8 +11,9 @@ import { getRuntime } from '@/lib/runtime'
+ import './onboarding.css'
+ 
+ const steps = () => [t('Welcome'), t('Privacy'), t('Transcription'), t('Profile'), t('Recordings')]
+-const SPEECH: SpeechProvider[] = ['whisper', 'mistral', 'openai', 'deepgram', 'assemblyai']
++const SPEECH: SpeechProvider[] = ['local-pipeline', 'whisper', 'mistral', 'openai', 'deepgram', 'assemblyai']
+ const blurb = (): Record<SpeechProvider, string> => ({
++  'local-pipeline': t('Runs on this computer. faster-whisper large-v3-turbo with Nemotron-3 speaker labels; needs the pipeline Python and NeMo-Speech.cpp.'),
+   whisper: t('Runs on this computer. Needs whisper.cpp and a model file.'),
+   mistral: t('Voxtral: fast, multilingual, strong in French.'),
+   openai: t('Whisper and GPT-4o transcribe; accepts a context prompt.'),
+@@ -62,7 +63,7 @@ function Onboarding({ onClose }: { onClose: () => void }) {
+     if (to) navigate(to)
+   })
+   const local = settings?.privacyMode === 'local-only'
+-  const engine = settings?.transcriptionEngine ?? 'whisper'
++  const engine = settings?.transcriptionEngine ?? 'local-pipeline'
+   const capability = settings?.capabilities[engine]
+   const needsKey = Boolean(settings && capability && !capability.local)
+   const keyName = `${engine}ApiKey`
+@@ -120,7 +121,7 @@ function Onboarding({ onClose }: { onClose: () => void }) {
+             <Dialog.Title>{t('Where should AI run?')}</Dialog.Title>
+             <Dialog.Description id="onboarding-step-description">{t('You can change this any time in Settings. Local only blocks every cloud call, including fallbacks.')}</Dialog.Description>
+             <div className="onboarding-choices" role="radiogroup" aria-label={t('Processing privacy')}>
+-              <button type="button" className="onboarding-card" role="radio" aria-checked={local} disabled={!settings} onClick={() => settings && setSettings({ ...settings, privacyMode: 'local-only', transcriptionEngine: 'whisper', transcriptionModel: '', transcriptionDiarize: false, transcriptionFallback: [], analysisProvider: 'ollama', analysisModel: '', documentProvider: 'ollama', documentModel: '', chatProvider: 'ollama', chatModel: '' })}>
++              <button type="button" className="onboarding-card" role="radio" aria-checked={local} disabled={!settings} onClick={() => settings && setSettings({ ...settings, privacyMode: 'local-only', transcriptionEngine: 'local-pipeline', transcriptionModel: '', transcriptionDiarize: true, transcriptionFallback: [], analysisProvider: 'ollama', analysisModel: '', documentProvider: 'ollama', documentModel: '', chatProvider: 'ollama', chatModel: '' })}>
+                 <Lock /><strong>{t('Local only')}</strong><span>{t('Whisper.cpp transcribes and Ollama writes documents, all on this machine. Slower, fully offline.')}</span>
+               </button>
+               <button type="button" className="onboarding-card" role="radio" aria-checked={settings ? !local : false} disabled={!settings} onClick={() => settings && setSettings({ ...settings, privacyMode: 'selected-providers' })}>
+@@ -134,7 +135,7 @@ function Onboarding({ onClose }: { onClose: () => void }) {
+             <Dialog.Description id="onboarding-step-description">{t('This is the default; each recording can still use another provider or profile.')}</Dialog.Description>
+             <div className="onboarding-providers" role="radiogroup" aria-label={t('Transcription provider')}>
+               {SPEECH.map(id => { const item = settings.capabilities[id]; const blocked = local && !item.local
+-                return <button key={id} type="button" className="onboarding-card" role="radio" aria-checked={engine === id} disabled={blocked || busy} onClick={() => { setChecked(''); setKey(''); setSettings({ ...settings, transcriptionEngine: id, transcriptionModel: '', transcriptionDiarize: false, transcriptionVocabulary: [], transcriptionFallback: [], ...(item.prompt ? {} : { transcriptionPrompt: '' }) }) }}>
++                return <button key={id} type="button" className="onboarding-card" role="radio" aria-checked={engine === id} disabled={blocked || busy} onClick={() => { setChecked(''); setKey(''); setSettings({ ...settings, transcriptionEngine: id, transcriptionModel: '', transcriptionDiarize: id === 'local-pipeline', transcriptionVocabulary: [], transcriptionFallback: [], ...(item.prompt ? {} : { transcriptionPrompt: '' }) }) }}>
+                   <strong>{item.label}</strong><span>{blurb()[id]}</span>
+                   <small>{[item.local ? t('On device') : t('Cloud'), item.prompt && t('Prompt'), item.vocabulary && t('Vocabulary'), item.diarization && t('Speakers')].filter(Boolean).join(' · ')}</small>
+                 </button> })}
+@@ -148,7 +149,7 @@ function Onboarding({ onClose }: { onClose: () => void }) {
+               <label>{t('{provider} API key', { provider: capability.label })}<input type="password" autoComplete="off" value={key} placeholder={hasKey ? t('Saved key — leave empty to keep it') : t('Paste your key')} onChange={event => { setKey(event.target.value); setChecked('') }} /></label>
+               <Button type="button" variant="outline" disabled={busy || (!key.trim() && !hasKey)} onClick={() => void check()}>{checked === engine ? <CheckCircle2 /> : busy ? <Loader2 className="animate-spin" /> : <ShieldCheck />}{checked === engine ? t('Connected') : t('Check')}</Button>
+               <p>{t('Keys are stored in this vault only and never shown again. The check lists your models; it sends no audio.')}</p>
+-            </div> : <p className="onboarding-note">{status?.engine === 'whisper' && status.engineReady ? <><CheckCircle2 />{t('whisper.cpp is installed.')}</> : <>{t('Install {package} and put {file} in {folder}. OpenPlod never downloads models for you.', { package: 'whisper-cpp', file: `ggml-${settings.transcriptionModel || 'base'}.bin`, folder: 'WHISPER_MODELS_DIR' })}</>}</p>}
++            </div> : <p className="onboarding-note">{engine === 'local-pipeline' ? (status?.engine === 'local-pipeline' && status.engineReady ? <><CheckCircle2 />{t('The local pipeline is installed.')}</> : <>{t('Install the pipeline Python (faster-whisper) and NeMo-Speech.cpp, then check the paths in Settings, AI providers, Local pipeline. OpenPlod never downloads models for you.')}</>) : status?.engine === 'whisper' && status.engineReady ?<><CheckCircle2 />{t('whisper.cpp is installed.')}</> : <>{t('Install {package} and put {file} in {folder}. OpenPlod never downloads models for you.', { package: 'whisper-cpp', file: `ggml-${settings.transcriptionModel || 'base'}.bin`, folder: 'WHISPER_MODELS_DIR' })}</>}</p>}
+           </section>}
+ 
+           {step === 3 && <section>
+diff --git a/web/src/components/TranscriptStudio.tsx b/web/src/components/TranscriptStudio.tsx
+index 32f4b3f..9a3d231 100644
+--- a/web/src/components/TranscriptStudio.tsx
++++ b/web/src/components/TranscriptStudio.tsx
+@@ -440,7 +440,7 @@ function VersionsPanel({ recording, busy, run, onChanged }: {
+ }
+ 
+ const providerLabel = (name: string) => ({
+-  whisper: t('Whisper.cpp (local)'), mistral: 'Mistral Voxtral', deepgram: 'Deepgram', openai: 'OpenAI', assemblyai: 'AssemblyAI',
++  'local-pipeline': t('Local pipeline (faster-whisper + Nemotron-3)'), whisper: t('Whisper.cpp (local)'), mistral: 'Mistral Voxtral', deepgram: 'Deepgram', openai: 'OpenAI', assemblyai: 'AssemblyAI',
+ } as Record<string, string>)[name] ?? name
+ 
+ // ---------------------------------------------------------------------------
+@@ -487,7 +487,7 @@ function ProviderComparison({ recording, busy, run, onVersionAdded }: {
+   }, [pending, load])
+ 
+   const choices = Object.entries(available).filter(([, ok]) => ok).map(([name]) => name)
+-  const local = provider === 'whisper'
++  const local = provider === 'whisper' || provider === 'local-pipeline'
+ 
+   return (
+     <>
+@@ -512,7 +512,7 @@ function ProviderComparison({ recording, busy, run, onVersionAdded }: {
+               <label className="tstudio-confirm">
+                 <input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />
+                 {local
+-                  ? t('I understand the audio is transcribed again locally with Whisper.cpp, which can take a while.')
++                  ? t('I understand the audio is transcribed again on this computer with {provider}, which can take a while.', { provider: providerLabel(provider) })
+                   : t('I understand the full audio is uploaded again to {provider} and this run may be billed by that provider. Cost is not estimated here.', { provider: providerLabel(provider) })}
+               </label>
+             )}
+diff --git a/web/src/components/WorkspaceTiles.tsx b/web/src/components/WorkspaceTiles.tsx
+index 2ea61d0..1b84f40 100644
+--- a/web/src/components/WorkspaceTiles.tsx
++++ b/web/src/components/WorkspaceTiles.tsx
+@@ -58,7 +58,7 @@ export function WorkspaceTiles() {
+         </span>
+         <div>
+           <strong>{t("Transcripts")}</strong>
+-          <p>{engine === 'whisper' ? t('Powered by local Whisper') : engine ? t('Powered by {engine}', { engine: { mistral: 'Mistral', deepgram: 'Deepgram', openai: 'OpenAI', assemblyai: 'AssemblyAI' }[engine] }) : t('Transcription settings')}</p>
++          <p>{engine === 'local-pipeline' ? t('Powered by the local pipeline') : engine === 'whisper' ? t('Powered by local Whisper') : engine ? t('Powered by {engine}', { engine: { mistral: 'Mistral', deepgram: 'Deepgram', openai: 'OpenAI', assemblyai: 'AssemblyAI' }[engine] }) : t('Transcription settings')}</p>
+         </div>
+         <ChevronRight className="tile-arrow" />
+       </Link>
+diff --git a/web/src/lib/ai-settings.ts b/web/src/lib/ai-settings.ts
+index 7a1f578..731d40f 100644
+--- a/web/src/lib/ai-settings.ts
++++ b/web/src/lib/ai-settings.ts
+@@ -11,9 +11,11 @@ export type AiSettings = AiConfig & {
+   credentials: Record<string, boolean>; capabilities: typeof speechCapabilities
+   textCapabilities: Record<TextProvider, TextCapability>
+   pricing: { pricesAsOf: string; label: string; speech: typeof speechPrices; text: typeof textPrices }
++  /** What the local pipeline uses with the current settings (blank fields resolved to their defaults). */
++  pipelineResolved: { python: string; pythonFound: boolean; nemo: string[]; workFolder: string; exportFolder: string }
+ }
+ /** Read-only fields the settings endpoint adds; they are never sent back on save. */
+-export const READ_ONLY_SETTINGS = ['credentials', 'capabilities', 'textCapabilities', 'pricing'] as const
++export const READ_ONLY_SETTINGS = ['credentials', 'capabilities', 'textCapabilities', 'pricing', 'pipelineResolved'] as const
+ export type CostEstimate = ReturnType<typeof estimateRecordings>
+ export type MonthSpend = ReturnType<typeof monthToDate>
+ export type ProcessingJob = { id: string; recordingId: string; provider?: string; status: string; error?: string; priority: number; attempts?: number; checkpoint?: { phase: string; remoteId?: string; inFlight?: boolean; progress?: { done: number; total: number } } }
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index c3d6e29..7d9152a 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -244,7 +244,7 @@ export interface SearchResult {
+ }
+ 
+ export interface Settings {
+-  transcriptionEngine: 'whisper' | 'mistral' | 'deepgram' | 'openai' | 'assemblyai'
++  transcriptionEngine: 'local-pipeline' | 'whisper' | 'mistral' | 'deepgram' | 'openai' | 'assemblyai'
+   mistralApiKey?: string
+   deepgramApiKey?: string
+   mistralApiKeyConfigured?: boolean
+@@ -635,9 +635,9 @@ export const api = {
+     const d = res.data
+     const engine = typeof d.transcriptionEngine === 'string' ? d.transcriptionEngine : ''
+     return {
+-      transcriptionEngine: ['whisper', 'mistral', 'deepgram', 'openai', 'assemblyai'].includes(engine)
++      transcriptionEngine: ['local-pipeline', 'whisper', 'mistral', 'deepgram', 'openai', 'assemblyai'].includes(engine)
+         ? engine as Settings['transcriptionEngine']
+-        : 'whisper',
++        : 'local-pipeline',
+       mistralApiKey: typeof d.mistralApiKey === 'string' ? d.mistralApiKey : '',
+       deepgramApiKey: typeof d.deepgramApiKey === 'string' ? d.deepgramApiKey : '',
+       mistralApiKeyConfigured: d.mistralApiKeyConfigured === 'true' || d.mistralApiKeyConfigured === true,
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index 098612d..ed2b5bc 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -53,7 +53,7 @@ export function SettingsPage() {
+   const runtime = getRuntime()
+   const locale = useLocale()
+   const [settings, setSettings] = useState<Settings>({
+-    transcriptionEngine: 'whisper',
++    transcriptionEngine: 'local-pipeline',
+     mistralApiKey: '',
+     deepgramApiKey: '',
+     mistralApiKeyConfigured: false,
