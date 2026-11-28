@@ -22,8 +22,9 @@ const inputs: Record<string, string> = {
   bun: run(['bun', '--version']) ?? '',
   rustc: run(['rustc', '--version']) ?? '',
   // The version line names the exact ffmpeg commit; the daily-rebuilt zip's own hash would
-  // change every day without any change in ffmpeg.
-  ffmpeg: process.env.FFMPEG_VERSION ?? '',
+  // change every day without any change in ffmpeg. The line also ends the version with the
+  // build date (e.g. n9.0.2-982-g836df4e858-20261127), so drop that date and keep the commit.
+  ffmpeg: (process.env.FFMPEG_VERSION ?? '').replace(/(-g[0-9a-f]+)-\d{8}\b/, '$1'),
 };
 for (const lock of ['bun.lock', 'web/bun.lock', 'src-tauri/Cargo.lock', 'src-tauri/plaud-bridge/Cargo.lock']) inputs[lock] = hashFile(lock);
 for (const path of filesUnder(join(autobuild, '.github')).sort()) inputs[relative(autobuild, path).split('\\').join('/')] = hashFile(path);
